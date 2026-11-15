@@ -1,5 +1,5 @@
-//! drive-index command-line interface (PLAN.md §8). The TUI (M3) will become the
-//! default command; until then running without a subcommand prints help.
+//! drive-index command-line interface. Run without a subcommand in a terminal, it
+//! starts the TUI.
 
 mod catalog_cmd;
 mod lock;

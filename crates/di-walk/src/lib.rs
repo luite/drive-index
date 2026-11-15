@@ -1,4 +1,4 @@
-//! Fast, parallel, read-only directory walking (PLAN.md §4.2–4.4).
+//! Fast, parallel, read-only directory walking.
 //!
 //! The walker has no knowledge of the catalog: it emits one [`DirBatch`] per listed
 //! directory over a channel, and the consumer (the staging writer) persists them.

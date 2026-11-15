@@ -1,4 +1,4 @@
-//! Merge a finished staging DB into the main catalog (PLAN.md §4.9).
+//! Merge a finished staging DB into the main catalog.
 //!
 //! One transaction: insert the new tree with ids offset above the current maximum,
 //! carry hashes and media metadata over to unchanged files, delete the previous

@@ -1,4 +1,4 @@
-//! SMART snapshots (PLAN.md §3.6): one row per reading, plus whether SMART works
+//! SMART snapshots: one row per reading, plus whether SMART works
 //! for the drive at all (`drives.smart_*`).
 
 use anyhow::Result;

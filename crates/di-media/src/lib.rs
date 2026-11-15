@@ -1,4 +1,4 @@
-//! Content-derived file data (PLAN.md §4.10): quick hashes and media metadata.
+//! Content-derived file data: quick hashes and media metadata.
 //!
 //! One [`HeadTailReader`] per file fetches the start and end (two reads), which serve
 //! both the quick hash and most metadata parsers. Parsers: `nom-exif` for photo EXIF

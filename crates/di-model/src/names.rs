@@ -11,7 +11,7 @@ pub struct StoredName {
     pub raw: Option<Vec<u8>>,
 }
 
-/// Normalize raw on-disk name bytes for storage (PLAN.md §4.6): lossy UTF-8, then NFC.
+/// Normalize raw on-disk name bytes for storage: lossy UTF-8, then NFC.
 /// `raw` is kept only when the stored form differs from the original bytes.
 pub fn normalize(raw: &[u8]) -> StoredName {
     // Fast path for the common case: ASCII is valid UTF-8 and already NFC.
@@ -66,7 +66,7 @@ pub fn is_trash_dir(name: &str) -> bool {
         || name.eq_ignore_ascii_case("RECYCLER")
 }
 
-/// Default directories whose contents are not indexed (PLAN.md §4.6).
+/// Default directories whose contents are not indexed.
 pub const DEFAULT_SKIP_DIRS: &[&str] = &[
     ".Spotlight-V100",
     ".fseventsd",

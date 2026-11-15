@@ -740,6 +740,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "di-model",
+ "libc",
  "objc2-core-foundation",
  "objc2-disk-arbitration",
  "plist",
@@ -866,6 +867,13 @@ dependencies = [
  "jiff",
  "libc",
  "serde_json",
+]
+
+[[package]]
+name = "drive-index-smart"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

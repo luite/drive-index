@@ -1,4 +1,4 @@
-//! The search language (PLAN.md §6): parsing and compilation to SQL.
+//! The search language: parsing and compilation to SQL.
 //!
 //! ```text
 //! query := term (' ' term)*          terms are AND-ed

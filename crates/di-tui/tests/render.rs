@@ -1,5 +1,5 @@
 //! Render the TUI against a real catalog with ratatui's TestBackend and drive it
-//! with key events (PLAN.md §13).
+//! with key events.
 
 use std::path::Path;
 use std::time::{Duration, Instant};

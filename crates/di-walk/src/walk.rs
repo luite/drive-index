@@ -1,4 +1,4 @@
-//! Parallel directory walk (PLAN.md §4.2, §4.7).
+//! Parallel directory walk.
 //!
 //! The unit of work is a directory. Workers pop a [`DirJob`] from a shared LIFO stack
 //! (depth-first order keeps locality), list it, send one [`DirBatch`] to the sink and

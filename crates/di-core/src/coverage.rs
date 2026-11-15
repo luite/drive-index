@@ -1,4 +1,4 @@
-//! Collection coverage (PLAN.md §5.5, §7.6): which drives hold how much of a
+//! Collection coverage: which drives hold how much of a
 //! collection, and what exists in only one place.
 //!
 //! An *item* is one piece of content, identified by its quick hash (which covers

@@ -1,4 +1,4 @@
-//! Bits of `files.flags` / `dirs.flags` (PLAN.md §5.3). The numbering is part of the
+//! Bits of `files.flags` / `dirs.flags`. The numbering is part of the
 //! on-disk format: never renumber, only append.
 
 pub const HIDDEN: u32 = 1 << 0;

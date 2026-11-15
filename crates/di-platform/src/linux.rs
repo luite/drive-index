@@ -279,7 +279,7 @@ fn unmountable_reason(fs: &str) -> Option<String> {
     }
 }
 
-/// Mount options for a truly read-only mount (PLAN.md §3.4).
+/// Mount options for a truly read-only mount.
 fn ro_options(fs: &str) -> &'static str {
     match fs {
         "ext3" | "ext4" => "ro,noload",

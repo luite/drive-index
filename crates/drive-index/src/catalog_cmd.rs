@@ -1,4 +1,4 @@
-//! Catalog sessions and `drive-index db …` (PLAN.md §5.6).
+//! Catalog sessions and `drive-index db …`.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

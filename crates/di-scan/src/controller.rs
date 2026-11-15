@@ -1,4 +1,4 @@
-//! The drive controller (PLAN.md §2.1–2.2): one thread that reacts to device events,
+//! The drive controller: one thread that reacts to device events,
 //! applies the policy, queues and runs device scans one at a time, and executes
 //! commands from a front end (TUI or the headless `watch`). Front ends receive
 //! [`Event`]s and read live progress from the shared counters.

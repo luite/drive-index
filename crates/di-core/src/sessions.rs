@@ -1,4 +1,4 @@
-//! Moving the catalog between hosts by copying the file (PLAN.md §5.6).
+//! Moving the catalog between hosts by copying the file.
 //!
 //! * Every read-write use of the catalog is a *session* (row in `sessions`).
 //! * Each host remembers, outside the catalog, the latest session it has seen per

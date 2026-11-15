@@ -1,4 +1,4 @@
-//! Drawing (PLAN.md §7). Pure functions of `App`; no state changes here except
+//! Drawing. Pure functions of `App`; no state changes here except
 //! scroll offsets in table/list state.
 
 use std::sync::atomic::Ordering;

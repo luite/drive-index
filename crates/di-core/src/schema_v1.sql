@@ -1,4 +1,4 @@
--- drive-index catalog schema, version 1 (PLAN.md §5.2).
+-- drive-index catalog schema, version 1.
 -- Timestamps *_ns: INTEGER nanoseconds since the Unix epoch (UTC).
 -- Bookkeeping *_at: INTEGER unix seconds. Booleans: 0/1, NULL = unknown.
 

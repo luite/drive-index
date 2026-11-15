@@ -1,6 +1,6 @@
 //! Linux fast path: `getdents64` (via rustix `RawDir`) + `statx` relative to the
 //! directory fd. Entries are stat'ed in inode order, which reduces seeks on
-//! ext2/3/4, xfs and hfsplus on rotational media (PLAN.md §4.3).
+//! ext2/3/4, xfs and hfsplus on rotational media.
 
 use std::ffi::OsStr;
 use std::io;

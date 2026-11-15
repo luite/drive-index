@@ -1,4 +1,4 @@
-//! Environment and external-tool checks (PLAN.md §3.8).
+//! Environment and external-tool checks.
 //!
 //! Each check reports whether a component is *usable* (not merely present), what it
 //! enables, and how to fix it on this host. Missing tools only degrade their own
@@ -129,7 +129,7 @@ impl Installer {
         }
     }
 
-    /// Package name for a tool, per PLAN.md §3.8.
+    /// Package name for a tool.
     fn package(self, tool: &str) -> Option<&'static str> {
         use Installer::*;
         Some(match (tool, self) {
@@ -230,10 +230,24 @@ fn check_smartctl(ctx: &Ctx) -> Check {
                 c.status = Status::Error;
                 c.detail = Some("smartmontools 7.0 or newer is needed for JSON output".into());
                 (c.fix, c.package) = ctx.missing("smartctl");
+            } else if let Ok(cmd) = std::env::var("DRIVE_INDEX_SMARTCTL") {
+                c.status = Status::Ok;
+                c.detail = Some(format!("runs `{cmd}` (DRIVE_INDEX_SMARTCTL)"));
             } else if cfg!(target_os = "linux") && !ctx.root {
-                c.status = Status::Warn;
-                c.detail = Some("reading SMART data needs root on Linux".into());
-                c.fix = Some("run drive-index with sudo, or allow `sudo -n smartctl` for your user".into());
+                match di_platform::smart::helper() {
+                    Some(h) => {
+                        c.status = Status::Ok;
+                        c.detail = Some(format!("as a normal user through the setuid helper {}", h.display()));
+                    }
+                    None => {
+                        c.status = Status::Warn;
+                        c.detail = Some("reading SMART data needs root on Linux".into());
+                        c.fix = Some(
+                            "install the setuid helper drive-index-smart (README: \"SMART on Linux without root\"), or run drive-index with sudo"
+                                .into(),
+                        );
+                    }
+                }
             } else if cfg!(target_os = "macos") {
                 c.status = Status::Ok;
                 c.detail = Some("note: macOS cannot read SMART over USB without a third-party driver".into());

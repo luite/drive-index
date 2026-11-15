@@ -1,4 +1,4 @@
-//! Reading SMART with `smartctl -j` (PLAN.md §3.6, decision D6).
+//! Reading SMART with `smartctl -j`.
 //!
 //! USB bridges need the right `-d` type; smartctl's own database usually picks it
 //! (`auto`), and on Linux we fall back through the common bridge types. macOS
@@ -18,8 +18,9 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// Bridge types tried after `auto` on Linux, most common first.
 const USB_TYPES: &[&str] = &["sat", "sntjmicron", "sntasmedia", "sntrealtek", "usbjmicron", "usbcypress", "usbprolific", "usbsunplus"];
 
-/// The smartctl command: `DRIVE_INDEX_SMARTCTL` (e.g. `sudo -n smartctl`), else
-/// smartctl from PATH or the usual sbin directories.
+/// The smartctl command: `DRIVE_INDEX_SMARTCTL` (e.g. `sudo -n smartctl`); on Linux
+/// as a normal user the setuid helper `drive-index-smart` if installed; else smartctl
+/// from PATH or the usual sbin directories.
 pub fn command() -> Option<Vec<String>> {
     if let Ok(c) = std::env::var("DRIVE_INDEX_SMARTCTL") {
         let parts: Vec<String> = c.split_whitespace().map(str::to_string).collect();
@@ -27,7 +28,44 @@ pub fn command() -> Option<Vec<String>> {
             return Some(parts);
         }
     }
-    locate("smartctl").map(|p| vec![p.display().to_string()])
+    let smartctl = locate("smartctl")?;
+    if cfg!(target_os = "linux") && !is_root() {
+        if let Some(h) = helper() {
+            return Some(vec![h.display().to_string()]);
+        }
+    }
+    Some(vec![smartctl.display().to_string()])
+}
+
+fn is_root() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// The setuid helper, if installed usably: `drive-index-smart` next to this program,
+/// on PATH, or in /usr/local/bin, /usr/local/libexec or /usr/libexec; owned by root
+/// with the setuid bit, and executable by this user.
+pub fn helper() -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    const NAME: &str = "drive-index-smart";
+    let beside = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(NAME)));
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let fixed = ["/usr/local/bin", "/usr/local/libexec", "/usr/libexec", "/usr/bin"];
+    beside
+        .into_iter()
+        .chain(std::env::split_paths(&path).map(|d| d.join(NAME)))
+        .chain(fixed.iter().map(|d| Path::new(d).join(NAME)))
+        .find(|p| {
+            let setuid_root = std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.uid() == 0 && m.mode() & 0o4000 != 0);
+            setuid_root && executable_by_me(p)
+        })
+}
+
+fn executable_by_me(p: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else { return false };
+    // SAFETY: `c` is a valid NUL-terminated path.
+    unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
 }
 
 fn locate(name: &str) -> Option<PathBuf> {

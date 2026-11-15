@@ -1,6 +1,6 @@
 //! Byte-size parsing and formatting.
 //!
-//! Parsing follows the search language (PLAN.md §6): `K`/`M`/`G`/`T`/`P` (and `KiB`…)
+//! Parsing follows the search language: `K`/`M`/`G`/`T`/`P` (and `KiB`…)
 //! are binary, `KB`/`MB`/… are decimal, a bare number is bytes.
 
 pub fn parse_size(input: &str) -> Result<u64, String> {

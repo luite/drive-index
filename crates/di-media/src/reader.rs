@@ -1,5 +1,5 @@
 //! `Read + Seek` over a file that prefetches the start and end in two reads and
-//! serves parser accesses from memory where possible (PLAN.md §4.10). Other ranges
+//! serves parser accesses from memory where possible. Other ranges
 //! are read on demand, up to a cap, so a malformed file cannot make us read it all.
 
 use std::fs::File;

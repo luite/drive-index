@@ -1,4 +1,4 @@
-//! The interactive terminal UI (PLAN.md §7).
+//! The interactive terminal UI.
 
 pub mod app;
 pub mod assist;

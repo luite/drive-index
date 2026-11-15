@@ -1,4 +1,4 @@
-//! Drive identifiers and match scoring (PLAN.md §3.3).
+//! Drive identifiers and match scoring.
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Identifier {

@@ -1,4 +1,4 @@
-//! Physical drives in the catalog: identity matching (PLAN.md §3.3) and records for
+//! Physical drives in the catalog: identity matching and records for
 //! drives, identifiers, partitions and filesystems.
 
 use anyhow::Result;

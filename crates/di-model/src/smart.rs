@@ -1,4 +1,4 @@
-//! SMART health as read by smartctl (PLAN.md §3.6), in a form shared by the
+//! SMART health as read by smartctl, in a form shared by the
 //! platform layer (which reads it), the catalog (which stores snapshots) and the UI.
 
 use crate::units::{format_count, format_size};

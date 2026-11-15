@@ -1,4 +1,4 @@
-//! Scanning a whole drive (PLAN.md §2.1): probe → identify → record → mount each
+//! Scanning a whole drive: probe → identify → record → mount each
 //! filesystem read-only → scan → unmount → eject.
 
 use std::path::PathBuf;

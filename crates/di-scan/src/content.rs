@@ -1,4 +1,4 @@
-//! The content phase (PLAN.md §4.10): after a filesystem's walk has been merged and
+//! The content phase: after a filesystem's walk has been merged and
 //! while it is still mounted, read file contents for quick hashes and media metadata.
 //!
 //! "Pending" is a query, not stored state: media files without metadata (or with

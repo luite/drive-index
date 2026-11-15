@@ -1,4 +1,4 @@
-//! Per-scan staging database (PLAN.md §4.7, §4.9).
+//! Per-scan staging database.
 //!
 //! Same tables as the main catalog's `dirs`/`files`/`scan_errors`, but without
 //! secondary indexes, so inserts are fast. `dirs.state` makes the staging DB a

@@ -1,4 +1,4 @@
-//! Duplicate groups (PLAN.md §7.5) at three confidence levels:
+//! Duplicate groups at three confidence levels:
 //! exact (full BLAKE3), likely (quick hash + size), probable (same name and size).
 
 use anyhow::Result;

@@ -1,4 +1,4 @@
-//! Drive identifiers (PLAN.md §3.3): every identifier a probe reveals, with the
+//! Drive identifiers: every identifier a probe reveals, with the
 //! strength used to recognise the drive again on a later connect or another host.
 
 use crate::DriveProbe;

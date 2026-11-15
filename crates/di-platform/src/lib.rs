@@ -1,4 +1,4 @@
-//! Platform device layer (PLAN.md §3): find drives, describe them, mount their
+//! Platform device layer: find drives, describe them, mount their
 //! filesystems read-only, unmount, eject, and report hot-plug events.
 //!
 //! * macOS: DiskArbitration for events; `diskutil … -plist` and the IORegistry for
