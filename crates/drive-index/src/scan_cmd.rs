@@ -33,6 +33,15 @@ pub fn scan_dir(req: &ScanRequest, quiet: bool) -> Result<ExitCode> {
     match out.status {
         ScanStatus::Complete => {
             println!("Scanned D{} — {}.", out.drive_id, describe_outcome(&out, req.walk.threads));
+            if let Some(c) = out.content.filter(|c| c.processed > 0) {
+                println!(
+                    "Read {} files for metadata and quick hashes ({} with metadata) in {}{}.",
+                    format_count(c.processed),
+                    format_count(c.media),
+                    di_model::units::format_duration(std::time::Duration::from_millis(c.ms)),
+                    if c.cancelled { "; stopped, continues next time" } else { "" }
+                );
+            }
             Ok(ExitCode::SUCCESS)
         }
         ScanStatus::Interrupted => {

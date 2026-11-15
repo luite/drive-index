@@ -45,33 +45,15 @@ impl QueryError {
 /// Filters implemented now.
 const KEYS: &[&str] = &[
     "name", "path", "ext", "type", "size", "date", "mtime", "btime", "ctime", "drive", "fs", "fstype",
-    "kind", "in",
+    "kind", "in", "taken", "when", "camera", "lens", "iso", "focal", "aperture", "gps", "res", "width",
+    "height", "duration", "codec", "artist", "album", "title", "genre", "year", "media",
 ];
 
 /// Filters that exist in the language but need data from later milestones.
 const FUTURE_KEYS: &[(&str, &str)] = &[
-    ("online", "device detection (M2)"),
-    ("dup", "content hashes (M4)"),
-    ("copies", "content hashes (M4)"),
-    ("taken", "media metadata (M4)"),
-    ("when", "media metadata (M4)"),
-    ("camera", "media metadata (M4)"),
-    ("lens", "media metadata (M4)"),
-    ("iso", "media metadata (M4)"),
-    ("focal", "media metadata (M4)"),
-    ("aperture", "media metadata (M4)"),
-    ("gps", "media metadata (M4)"),
-    ("res", "media metadata (M4)"),
-    ("width", "media metadata (M4)"),
-    ("height", "media metadata (M4)"),
-    ("duration", "media metadata (M4)"),
-    ("codec", "media metadata (M4)"),
-    ("artist", "media metadata (M4)"),
-    ("album", "media metadata (M4)"),
-    ("title", "media metadata (M4)"),
-    ("genre", "media metadata (M4)"),
-    ("year", "media metadata (M4)"),
-    ("media", "media metadata (M4)"),
+    ("online", "device detection in the search (coming)"),
+    ("dup", "duplicate detection (coming in M4)"),
+    ("copies", "duplicate detection (coming in M4)"),
 ];
 
 fn is_flag_key(key: &str) -> bool {
@@ -300,6 +282,66 @@ impl Compiler<'_> {
                 Ok(self.in_list("f.kind", codes))
             }
             "in" => self.collection(t),
+            "taken" => self.local_time_cond(t, "m.captured_at"),
+            "when" => {
+                let taken = self.local_time_cond(t, "m.captured_at")?;
+                let mtime = self.time_cond(t, "f.mtime_ns")?;
+                Ok(format!("(m.captured_at IS NOT NULL AND {taken}) OR (m.captured_at IS NULL AND {mtime})"))
+            }
+            "camera" => Ok(self.text_cond(&t.value, "COALESCE(m.camera_make, '') || ' ' || COALESCE(m.camera_model, '')")),
+            "lens" => Ok(self.text_cond(&t.value, "m.lens_model")),
+            "artist" => {
+                let a = self.text_cond(&t.value, "m.artist");
+                let b = self.text_cond(&t.value, "m.album_artist");
+                Ok(format!("{a} OR {b}"))
+            }
+            "album" => Ok(self.text_cond(&t.value, "m.album")),
+            "title" => Ok(self.text_cond(&t.value, "m.title")),
+            "genre" => Ok(self.text_cond(&t.value, "m.genre")),
+            "iso" => self.num_cond(t, "m.iso", |s| s.parse::<f64>().ok()),
+            "focal" => self.num_cond(t, "m.focal_mm", |s| s.trim_end_matches("mm").parse::<f64>().ok()),
+            "aperture" => self.num_cond(t, "m.f_number", |s| s.trim_start_matches(['f', 'F', '/']).parse::<f64>().ok()),
+            "year" => self.num_cond(t, "m.year", |s| s.parse::<f64>().ok()),
+            "width" => self.num_cond(t, "m.width", |s| s.parse::<f64>().ok()),
+            "height" => self.num_cond(t, "m.height", |s| s.parse::<f64>().ok()),
+            "duration" => self.num_cond(t, "m.duration_ms", |s| parse_duration_ms(s).map(|v| v as f64)),
+            "gps" => {
+                let on = parse_bool(&t.value).ok_or_else(|| QueryError::at(t, "'gps:' takes yes or no"))?;
+                Ok(if on { "m.gps_lat IS NOT NULL".into() } else { "m.gps_lat IS NULL".into() })
+            }
+            "res" => self.res_cond(t),
+            "codec" => {
+                let codecs: Vec<String> = alternatives(&t.value)
+                    .map(|c| match c.to_lowercase().as_str() {
+                        "h265" | "x265" => "hevc".to_string(),
+                        "avc" | "x264" => "h264".to_string(),
+                        other => other.to_string(),
+                    })
+                    .collect();
+                let list = self.in_list("lower(s.codec)", codecs);
+                Ok(format!("EXISTS (SELECT 1 FROM media_streams s WHERE s.file_id = f.id AND {list})"))
+            }
+            "media" => {
+                let mut ors = Vec::new();
+                for alt in alternatives(&t.value) {
+                    ors.push(match alt.to_lowercase().as_str() {
+                        "none" | "no" => "m.file_id IS NULL".to_string(),
+                        "any" | "yes" => "m.file_id IS NOT NULL".to_string(),
+                        "ok" => "m.status = 0".to_string(),
+                        "partial" => "m.status = 1".to_string(),
+                        "unsupported" => "m.status = 2".to_string(),
+                        "error" => "m.status = 3".to_string(),
+                        k @ ("image" | "video" | "audio") => format!("m.kind = {}", self.p(k.to_string())),
+                        other => {
+                            return Err(QueryError::at(
+                                t,
+                                format!("unknown media state '{other}' (none, any, ok, partial, unsupported, error, image, video, audio)"),
+                            ));
+                        }
+                    });
+                }
+                Ok(ors.join(" OR "))
+            }
             _ => Err(QueryError::at(t, format!("unknown filter '{key}:'"))),
         }
     }
@@ -326,6 +368,113 @@ impl Compiler<'_> {
         } else {
             exact
         }
+    }
+
+    /// Case-insensitive substring (or glob) on a descriptive text field. Globs match
+    /// anywhere (`camera:"EOS 5D*"` finds "Canon EOS 5D Mark III").
+    fn text_cond(&mut self, value: &str, expr: &str) -> String {
+        if value.contains(['*', '?']) {
+            let mut g = glob_lower(value);
+            if !g.starts_with('*') {
+                g.insert(0, '*');
+            }
+            if !g.ends_with('*') {
+                g.push('*');
+            }
+            format!("lower({expr}) GLOB {}", self.p(g))
+        } else {
+            format!("instr(lower({expr}), {}) > 0", self.p(value.to_lowercase()))
+        }
+    }
+
+    /// Numeric comparison: `>N`, `>=N`, `<N`, `<=N`, `N`, `a..b`.
+    fn num_cond(&mut self, t: &Term, col: &str, parse: impl Fn(&str) -> Option<f64>) -> Result<String, QueryError> {
+        let bad = |s: &str| QueryError::at(t, format!("invalid number '{s}'"));
+        let v = t.value.as_str();
+        if let Some((lo, hi)) = v.split_once("..") {
+            let mut parts = Vec::new();
+            if !lo.is_empty() {
+                parts.push(format!("{col} >= {}", self.p(parse(lo).ok_or_else(|| bad(lo))?)));
+            }
+            if !hi.is_empty() {
+                parts.push(format!("{col} <= {}", self.p(parse(hi).ok_or_else(|| bad(hi))?)));
+            }
+            if parts.is_empty() {
+                return Err(QueryError::at(t, "empty range"));
+            }
+            return Ok(parts.join(" AND "));
+        }
+        let (op, rest) = split_op(v);
+        let n = parse(rest).ok_or_else(|| bad(rest))?;
+        Ok(format!("{col} {} {}", op.unwrap_or("="), self.p(n)))
+    }
+
+    /// `res:>=3840x2160`, `res:1080p`, `res:4k` (default comparison: at least).
+    fn res_cond(&mut self, t: &Term) -> Result<String, QueryError> {
+        let (op, rest) = split_op(&t.value);
+        let op = op.unwrap_or(">=");
+        let (w, h): (Option<i64>, i64) = match rest.to_lowercase().as_str() {
+            "8k" | "4320p" => (None, 4320),
+            "4k" | "uhd" | "2160p" => (None, 2160),
+            "1440p" => (None, 1440),
+            "1080p" | "fhd" => (None, 1080),
+            "720p" | "hd" => (None, 720),
+            "480p" | "sd" => (None, 480),
+            other => {
+                let (a, b) = other
+                    .split_once('x')
+                    .ok_or_else(|| QueryError::at(t, "use WIDTHxHEIGHT (3840x2160) or 1080p / 4k"))?;
+                let parse = |s: &str| s.parse::<i64>().map_err(|_| QueryError::at(t, format!("invalid resolution '{rest}'")));
+                (Some(parse(a)?), parse(b)?)
+            }
+        };
+        // Portrait media: compare the short side to the named height.
+        let short = "MIN(m.width, m.height)";
+        Ok(match w {
+            Some(w) => format!("m.width {op} {} AND m.height {op} {}", self.p(w), self.p(h)),
+            None => format!("{short} {op} {}", self.p(h)),
+        })
+    }
+
+    /// Capture times are camera-local wall-clock strings; compare as strings.
+    fn local_time_cond(&mut self, t: &Term, col: &str) -> Result<String, QueryError> {
+        let tz = self.tz.clone();
+        let fmt = move |ns: i64| -> String {
+            jiff::Timestamp::from_nanosecond(ns as i128)
+                .map(|ts| ts.to_zoned(tz.clone()).strftime("%Y-%m-%dT%H:%M:%S").to_string())
+                .unwrap_or_default()
+        };
+        let v = t.value.as_str();
+        let (lo, hi) = if let Some((a, b)) = v.split_once("..") {
+            let lo = if a.is_empty() { None } else { Some(self.period(t, a)?.0) };
+            let hi = if b.is_empty() { None } else { Some(self.period(t, b)?.1) };
+            (lo, hi)
+        } else {
+            let (op, rest) = split_op(v);
+            if let Some(point) = self.relative(t, rest)? {
+                match op {
+                    None | Some("<") | Some("<=") => (Some(point), None),
+                    _ => (None, Some(point)),
+                }
+            } else {
+                let (start, end) = self.period(t, rest)?;
+                match op {
+                    None | Some("=") => (Some(start), Some(end)),
+                    Some(">") => (Some(end), None),
+                    Some(">=") => (Some(start), None),
+                    Some("<") => (None, Some(start)),
+                    _ => (None, Some(end)),
+                }
+            }
+        };
+        let mut parts = vec![format!("{col} IS NOT NULL")];
+        if let Some(lo) = lo {
+            parts.push(format!("{col} >= {}", self.p(fmt(lo))));
+        }
+        if let Some(hi) = hi {
+            parts.push(format!("{col} < {}", self.p(fmt(hi))));
+        }
+        Ok(parts.join(" AND "))
     }
 
     /// Directory path substring or glob, evaluated on the (much smaller) dirs table.
@@ -494,6 +643,44 @@ impl Compiler<'_> {
     }
 }
 
+/// `90`, `90s`, `10m`, `1h`, `1h30m`, `1:30:00`, `3:12` → milliseconds.
+pub fn parse_duration_ms(s: &str) -> Option<i64> {
+    let s = s.trim().to_lowercase();
+    if let Some(ms) = s.strip_suffix("ms") {
+        return ms.trim().parse::<f64>().ok().map(|v| v as i64);
+    }
+    if s.contains(':') {
+        let mut secs = 0i64;
+        for part in s.split(':') {
+            secs = secs * 60 + part.parse::<i64>().ok()?;
+        }
+        return Some(secs * 1000);
+    }
+    if let Ok(n) = s.parse::<f64>() {
+        return Some((n * 1000.0) as i64);
+    }
+    let mut total = 0f64;
+    let mut num = String::new();
+    for c in s.chars() {
+        if c.is_ascii_digit() || c == '.' {
+            num.push(c);
+        } else {
+            let n: f64 = num.parse().ok()?;
+            num.clear();
+            total += n * match c {
+                'h' => 3600.0,
+                'm' => 60.0,
+                's' => 1.0,
+                _ => return None,
+            };
+        }
+    }
+    if !num.is_empty() {
+        return None;
+    }
+    Some((total * 1000.0) as i64)
+}
+
 fn alternatives(v: &str) -> impl Iterator<Item = &str> {
     v.split(',').map(str::trim).filter(|s| !s.is_empty())
 }
@@ -581,6 +768,16 @@ mod tests {
         assert_eq!(parse("10:30").unwrap()[0].key, None);
         // A lone dash is text, not negation.
         assert_eq!(parse("a - b").unwrap()[1].value, "-");
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration_ms("90"), Some(90_000));
+        assert_eq!(parse_duration_ms("10m"), Some(600_000));
+        assert_eq!(parse_duration_ms("1h30m"), Some(5_400_000));
+        assert_eq!(parse_duration_ms("3:12"), Some(192_000));
+        assert_eq!(parse_duration_ms("1500ms"), Some(1500));
+        assert_eq!(parse_duration_ms("abc"), None);
     }
 
     #[test]

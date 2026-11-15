@@ -10,6 +10,7 @@ use di_core::{Catalog, DirSource, NewScan, SourceIds};
 use di_walk::{Control, DirBatch, Progress, WalkConfig, WalkOutcome, best_lister, stat_path, walk};
 
 use di_walk::host;
+use crate::content::{ContentConfig, ContentOutcome, run_content};
 use crate::merge::{MergeStats, merge};
 use crate::staging::{Staging, Totals, remove_db_files, run_writer};
 
@@ -28,6 +29,8 @@ pub struct ScanRequest {
     pub label: Option<String>,
     pub walk: WalkConfig,
     pub resume: ResumeMode,
+    /// Content phase (quick hashes + media metadata) after the walk; None skips it.
+    pub content: Option<ContentConfig>,
 }
 
 /// Coarse phase of a running scan, for progress displays.
@@ -39,6 +42,8 @@ pub enum Phase {
     Aggregating = 2,
     Merging = 3,
     Done = 4,
+    /// Reading file contents: quick hashes and media metadata.
+    Content = 5,
 }
 
 #[derive(Debug, Default)]
@@ -54,6 +59,7 @@ impl PhaseCell {
             1 => Phase::Walking,
             2 => Phase::Aggregating,
             3 => Phase::Merging,
+            5 => Phase::Content,
             _ => Phase::Done,
         }
     }
@@ -79,6 +85,7 @@ pub struct ScanOutcome {
     pub merge: MergeStats,
     pub walk_ms: u64,
     pub merge_ms: u64,
+    pub content: Option<ContentOutcome>,
 }
 
 pub fn run_dir_scan(req: &ScanRequest, control: &Control, progress: &Progress, phase: &PhaseCell) -> Result<ScanOutcome> {
@@ -102,7 +109,13 @@ pub fn run_dir_scan(req: &ScanRequest, control: &Control, progress: &Progress, p
         fs: host::fs_usage(&root),
     })?;
     let target = FsTarget { drive_id: ids.drive_id, filesystem_id: ids.filesystem_id, root };
-    run_fs_scan(&mut catalog, &target, &req.walk, req.resume, control, progress, phase)
+    let mut out = run_fs_scan(&mut catalog, &target, &req.walk, req.resume, control, progress, phase)?;
+    if let (ScanStatus::Complete, Some(cfg)) = (out.status, &req.content) {
+        phase.set(Phase::Content);
+        out.content = Some(run_content(&mut catalog, target.filesystem_id, &target.root, cfg, control, progress)?);
+        phase.set(Phase::Done);
+    }
+    Ok(out)
 }
 
 /// A filesystem in the catalog and where it is mounted right now.
@@ -211,6 +224,7 @@ pub fn run_fs_scan(
         merge: MergeStats::default(),
         walk_ms,
         merge_ms: 0,
+        content: None,
     };
 
     if outcome == WalkOutcome::Cancelled {

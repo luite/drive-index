@@ -275,6 +275,192 @@ pub struct FileDetail {
     pub link_target: Option<String>,
     pub scanned_at: Option<i64>,
     pub mount_point: Option<String>,
+    pub quick_hash: Option<String>,
+    pub media: Option<MediaDetail>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MediaDetail {
+    pub kind: String,
+    pub status: i64,
+    pub extractor: String,
+    pub captured_at: Option<String>,
+    pub captured_offset_min: Option<i64>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub gps: Option<(f64, f64)>,
+    pub camera: Option<String>,
+    pub lens: Option<String>,
+    pub iso: Option<i64>,
+    pub exposure_s: Option<f64>,
+    pub f_number: Option<f64>,
+    pub focal_mm: Option<f64>,
+    pub container: Option<String>,
+    pub bitrate_bps: Option<i64>,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub album_artist: Option<String>,
+    pub track_no: Option<i64>,
+    pub year: Option<i64>,
+    pub genre: Option<String>,
+    pub tags: Option<String>,
+    /// "video h264 1920x1080 25 fps", "audio aac 2 ch 48000 Hz eng", …
+    pub streams: Vec<String>,
+}
+
+impl MediaDetail {
+    /// Labelled lines for detail views.
+    pub fn lines(&self) -> Vec<(&'static str, String)> {
+        let mut out: Vec<(&'static str, String)> = Vec::new();
+        let status = match self.status {
+            0 => "",
+            1 => " (partial)",
+            2 => " (unsupported format)",
+            _ => " (error)",
+        };
+        out.push(("Media", format!("{} via {}{status}", self.kind, self.extractor)));
+        if let Some(c) = &self.captured_at {
+            let off = self
+                .captured_offset_min
+                .map(|m| format!(" UTC{}{:02}:{:02}", if m < 0 { '-' } else { '+' }, m.abs() / 60, m.abs() % 60))
+                .unwrap_or_default();
+            out.push(("Taken", format!("{}{off}", c.replace('T', " "))));
+        }
+        if let Some(c) = &self.camera {
+            out.push(("Camera", c.clone()));
+        }
+        if let Some(l) = &self.lens {
+            out.push(("Lens", l.clone()));
+        }
+        let mut exp = Vec::new();
+        if let Some(e) = self.exposure_s {
+            exp.push(if e > 0.0 && e < 1.0 { format!("1/{:.0} s", 1.0 / e) } else { format!("{e} s") });
+        }
+        if let Some(f) = self.f_number {
+            exp.push(format!("f/{f}"));
+        }
+        if let Some(i) = self.iso {
+            exp.push(format!("ISO {i}"));
+        }
+        if let Some(fl) = self.focal_mm {
+            exp.push(format!("{fl} mm"));
+        }
+        if !exp.is_empty() {
+            out.push(("Exposure", exp.join("  ")));
+        }
+        if let (Some(w), Some(h)) = (self.width, self.height) {
+            out.push(("Pixels", format!("{w} × {h}")));
+        }
+        if let Some(d) = self.duration_ms {
+            let s = d / 1000;
+            out.push(("Duration", format!("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)));
+        }
+        if let Some((lat, lon)) = self.gps {
+            out.push(("Location", format!("{lat:.5}, {lon:.5}")));
+        }
+        let audio = [
+            self.artist.clone(),
+            self.title.clone().map(|t| format!("“{t}”")),
+            self.album.clone().map(|a| format!("on {a}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if !audio.is_empty() {
+            out.push(("Track", audio.join(" ")));
+        }
+        let more = [
+            self.album_artist.clone().map(|a| format!("album artist {a}")),
+            self.track_no.map(|t| format!("track {t}")),
+            self.year.map(|y| y.to_string()),
+            self.genre.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if !more.is_empty() {
+            out.push(("", more.join(" · ")));
+        }
+        if let Some(c) = &self.container {
+            let br = self.bitrate_bps.map(|b| format!(", {} kb/s", b / 1000)).unwrap_or_default();
+            out.push(("Container", format!("{c}{br}")));
+        }
+        for s in &self.streams {
+            out.push(("Stream", s.clone()));
+        }
+        out
+    }
+}
+
+pub fn media_detail(conn: &Connection, file_id: i64) -> Result<Option<MediaDetail>> {
+    let Some(mut m) = conn
+        .query_row(
+            "SELECT kind, status, extractor, captured_at, captured_offset_min, width, height, duration_ms, gps_lat, gps_lon,
+                    TRIM(COALESCE(camera_make || ' ', '') || COALESCE(camera_model, '')), lens_model, iso, exposure_s,
+                    f_number, focal_mm, container, bitrate_bps, title, artist, album, album_artist, track_no, year,
+                    genre, tags
+             FROM media WHERE file_id = ?1",
+            [file_id],
+            |r| {
+                let lat: Option<f64> = r.get(8)?;
+                let lon: Option<f64> = r.get(9)?;
+                Ok(MediaDetail {
+                    kind: r.get(0)?,
+                    status: r.get(1)?,
+                    extractor: r.get(2)?,
+                    captured_at: r.get(3)?,
+                    captured_offset_min: r.get(4)?,
+                    width: r.get(5)?,
+                    height: r.get(6)?,
+                    duration_ms: r.get(7)?,
+                    gps: lat.zip(lon),
+                    camera: r.get::<_, Option<String>>(10)?.filter(|s| !s.is_empty()),
+                    lens: r.get(11)?,
+                    iso: r.get(12)?,
+                    exposure_s: r.get(13)?,
+                    f_number: r.get(14)?,
+                    focal_mm: r.get(15)?,
+                    container: r.get(16)?,
+                    bitrate_bps: r.get(17)?,
+                    title: r.get(18)?,
+                    artist: r.get(19)?,
+                    album: r.get(20)?,
+                    album_artist: r.get(21)?,
+                    track_no: r.get(22)?,
+                    year: r.get(23)?,
+                    genre: r.get(24)?,
+                    tags: r.get(25)?,
+                    streams: Vec::new(),
+                })
+            },
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let mut stmt = conn.prepare(
+        "SELECT type, codec, profile, width, height, fps, bitrate_bps, sample_rate, channels, language
+         FROM media_streams WHERE file_id = ?1 ORDER BY idx",
+    )?;
+    m.streams = stmt
+        .query_map([file_id], |r| {
+            let mut parts: Vec<String> = vec![r.get::<_, String>(0)?];
+            parts.extend(r.get::<_, Option<String>>(1)?);
+            parts.extend(r.get::<_, Option<String>>(2)?.map(|p| format!("({p})")));
+            if let (Some(w), Some(h)) = (r.get::<_, Option<i64>>(3)?, r.get::<_, Option<i64>>(4)?) {
+                parts.push(format!("{w}×{h}"));
+            }
+            parts.extend(r.get::<_, Option<f64>>(5)?.map(|f| format!("{f:.3} fps").replace(".000", "")));
+            parts.extend(r.get::<_, Option<i64>>(6)?.map(|b| format!("{} kb/s", b / 1000)));
+            parts.extend(r.get::<_, Option<i64>>(7)?.map(|s| format!("{s} Hz")));
+            parts.extend(r.get::<_, Option<i64>>(8)?.map(|c| format!("{c} ch")));
+            parts.extend(r.get::<_, Option<String>>(9)?);
+            Ok(parts.join(" "))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Some(m))
 }
 
 pub fn file_detail(conn: &Connection, file_id: i64) -> Result<Option<FileDetail>> {
@@ -283,9 +469,10 @@ pub fn file_detail(conn: &Connection, file_id: i64) -> Result<Option<FileDetail>
             "SELECT f.id, d.id, d.label, fs.id, COALESCE(fs.user_label, fs.volume_label), fs.fs_type,
                     CASE di.path WHEN '/' THEN '/' || f.name ELSE di.path || '/' || f.name END,
                     f.kind, f.size, f.alloc_size, f.mtime_ns, f.ctime_ns, f.btime_ns, f.mode, f.uid, f.gid, f.inode,
-                    f.nlink, f.flags, f.link_target, s.finished_at, fs.last_mount_point
+                    f.nlink, f.flags, f.link_target, s.finished_at, fs.last_mount_point, h.quick
              FROM files f JOIN dirs di ON di.id = f.dir_id JOIN filesystems fs ON fs.id = f.filesystem_id
              JOIN drives d ON d.id = fs.drive_id LEFT JOIN scans s ON s.id = fs.current_scan_id
+             LEFT JOIN file_hashes h ON h.file_id = f.id
              WHERE f.id = ?1",
             [file_id],
             |r| {
@@ -312,10 +499,16 @@ pub fn file_detail(conn: &Connection, file_id: i64) -> Result<Option<FileDetail>
                     link_target: r.get(19)?,
                     scanned_at: r.get(20)?,
                     mount_point: r.get(21)?,
+                    quick_hash: r.get::<_, Option<Vec<u8>>>(22)?.map(|h| h.iter().map(|b| format!("{b:02x}")).collect()),
+                    media: None,
                 })
             },
         )
-        .optional()?)
+        .optional()?
+        .map(|mut d: FileDetail| {
+            d.media = media_detail(conn, file_id).ok().flatten();
+            d
+        }))
 }
 
 /// A scanned filesystem, for the browse picker.

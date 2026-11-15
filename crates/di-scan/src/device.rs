@@ -40,6 +40,8 @@ pub struct DeviceScanRequest {
     pub identity: IdentityChoice,
     /// Allow internal (non-removable) disks. The system disk is always refused.
     pub allow_internal: bool,
+    /// Content phase per filesystem while mounted; None skips it.
+    pub content: Option<crate::content::ContentConfig>,
 }
 
 #[derive(Debug)]
@@ -80,6 +82,9 @@ pub enum Step<'a> {
     Mounting(&'a VolumeProbe),
     Scanning { vol: &'a VolumeProbe, mount_point: &'a std::path::Path },
     Scanned(&'a VolumeProbe, &'a ScanOutcome),
+    /// Content phase starting for a volume.
+    Content(&'a VolumeProbe),
+    ContentDone(&'a VolumeProbe, &'a crate::content::ContentOutcome),
     Unmounting,
     Ejecting,
 }
@@ -247,12 +252,28 @@ pub fn scan_device(
         reset_progress(progress);
         let target = FsTarget { drive_id, filesystem_id: fs_id, root };
         match run_fs_scan(&mut catalog, &target, &req.walk, req.resume, control, progress, phase) {
-            Ok(out) => {
+            Ok(mut out) => {
                 on_step(Step::Scanned(vol, &out));
                 if out.status == ScanStatus::Interrupted {
                     report.interrupted = true;
+                } else if let Some(cfg) = &req.content {
+                    on_step(Step::Content(vol));
+                    phase.set(crate::run::Phase::Content);
+                    match crate::content::run_content(&mut catalog, fs_id, &target.root, cfg, control, progress) {
+                        Ok(c) => {
+                            on_step(Step::ContentDone(vol, &c));
+                            if c.cancelled {
+                                report.interrupted = true;
+                            }
+                            out.content = Some(c);
+                        }
+                        Err(e) => vr.outcome = VolumeOutcome::Failed(format!("content phase: {e:#}")),
+                    }
+                    phase.set(crate::run::Phase::Done);
                 }
-                vr.outcome = VolumeOutcome::Scanned(Box::new(out));
+                if !matches!(vr.outcome, VolumeOutcome::Failed(_)) {
+                    vr.outcome = VolumeOutcome::Scanned(Box::new(out));
+                }
             }
             Err(e) => vr.outcome = VolumeOutcome::Failed(format!("{e:#}")),
         }
@@ -276,12 +297,7 @@ pub fn scan_device(
 }
 
 fn reset_progress(p: &Progress) {
-    use std::sync::atomic::Ordering::Relaxed;
-    p.files.store(0, Relaxed);
-    p.dirs.store(0, Relaxed);
-    p.bytes.store(0, Relaxed);
-    p.alloc_bytes.store(0, Relaxed);
-    p.errors.store(0, Relaxed);
+    p.reset();
 }
 
 /// One-line summary of a finished filesystem scan.
@@ -337,6 +353,27 @@ pub fn step_text(step: &Step, threads: usize) -> Option<String> {
             ScanStatus::Complete => format!("  {}: {}", v.dev, describe_outcome(out, threads)),
             ScanStatus::Interrupted => format!("  {}: interrupted (resumes next time)", v.dev),
         },
+        Step::Content(v) => format!("  {}: reading metadata and quick hashes…", v.dev),
+        Step::ContentDone(v, c) => {
+            let mut t = format!(
+                "  {}: {} files read ({} with metadata, {} hashed) in {}",
+                v.dev,
+                di_model::units::format_count(c.processed),
+                di_model::units::format_count(c.media),
+                di_model::units::format_count(c.hashed),
+                di_model::units::format_duration(std::time::Duration::from_millis(c.ms))
+            );
+            if c.errors > 0 {
+                t.push_str(&format!("; {} unreadable", c.errors));
+            }
+            if c.cancelled {
+                t.push_str("; stopped (continues next time)");
+            }
+            if c.processed == 0 {
+                return None;
+            }
+            t
+        }
         Step::Scanning { .. } | Step::Unmounting | Step::Ejecting => return None,
     })
 }

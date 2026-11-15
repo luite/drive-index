@@ -9,6 +9,7 @@ rust-version.workspace = true
 anyhow = "1.0.104"
 crossbeam-channel = "0.5.17"
 di-core = { version = "0.1.0", path = "../di-core" }
+di-media = { version = "0.1.0", path = "../di-media" }
 di-model = { version = "0.1.0", path = "../di-model" }
 di-platform = { version = "0.1.0", path = "../di-platform" }
 di-walk = { version = "0.1.0", path = "../di-walk" }

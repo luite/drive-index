@@ -67,6 +67,12 @@ enum Command {
         /// Don't show the progress line
         #[arg(long, short = 'q')]
         quiet: bool,
+        /// Skip reading file contents (media metadata and quick hashes)
+        #[arg(long)]
+        no_content: bool,
+        /// Threads for the content phase [default: 2, kind to hard disks]
+        #[arg(long)]
+        content_threads: Option<usize>,
         /// Drives: what to do afterwards
         #[arg(long, value_enum, default_value_t = AfterArg::Eject)]
         after: AfterArg,
@@ -92,6 +98,9 @@ enum Command {
         after: AfterArg,
         #[arg(long, short = 'j')]
         threads: Option<usize>,
+        /// Don't capture the mouse (keeps the terminal's own text selection)
+        #[arg(long)]
+        no_mouse: bool,
     },
     /// Watch for drives being connected; scan them and eject when done
     Watch {
@@ -259,7 +268,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let command = match cli.command {
         Some(c) => c,
         None if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() => {
-            Command::Tui { rescan_after: "30d".into(), include_images: false, after: AfterArg::Eject, threads: None }
+            Command::Tui { rescan_after: "30d".into(), include_images: false, after: AfterArg::Eject, threads: None, no_mouse: false }
         }
         None => {
             Cli::command().print_help()?;
@@ -276,11 +285,20 @@ fn run(cli: Cli) -> Result<ExitCode> {
             cross_mounts,
             atime,
             quiet,
+            no_content,
+            content_threads,
             after,
             new_drive,
             same_as,
             allow_internal,
         } => {
+            let content = (!no_content).then(|| {
+                let mut c = di_scan::content::ContentConfig::default();
+                if let Some(n) = content_threads {
+                    c.threads = n.max(1);
+                }
+                c
+            });
             let mut walk = walk_config(threads)?;
             walk.one_file_system = !cross_mounts;
             walk.record_atime = atime;
@@ -300,6 +318,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     after: after.to_after(),
                     identity,
                     allow_internal,
+                    content,
                 };
                 let _lock = lock::lock_or_fail(&req.catalog_path)?;
                 let session = SessionGuard::begin(&req.catalog_path, accept_stale)?;
@@ -307,14 +326,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 session.end()?;
                 Ok(code)
             } else {
-                let req = ScanRequest { catalog_path: db, dir: PathBuf::from(target), label, walk, resume };
+                let req = ScanRequest { catalog_path: db, dir: PathBuf::from(target), label, walk, resume, content };
                 let session = SessionGuard::begin(&req.catalog_path, accept_stale)?;
                 let code = scan_cmd::scan_dir(&req, quiet)?;
                 session.end()?;
                 Ok(code)
             }
         }
-        Command::Tui { rescan_after, include_images, after, threads } => {
+        Command::Tui { rescan_after, include_images, after, threads, no_mouse } => {
             let controller = ControllerOptions {
                 catalog_path: db.clone(),
                 policy: Policy {
@@ -334,11 +353,18 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         host,
                         controller: Some(controller),
                         viewer_reason: None,
+                        mouse: !no_mouse,
                     })?;
                     session.end()?;
                 }
                 Err(holder) => {
-                    di_tui::run(TuiOptions { catalog_path: db.clone(), host, controller: None, viewer_reason: Some(holder) })?
+                    di_tui::run(TuiOptions {
+                        catalog_path: db.clone(),
+                        host,
+                        controller: None,
+                        viewer_reason: Some(holder),
+                        mouse: !no_mouse,
+                    })?
                 }
             }
             Ok(ExitCode::SUCCESS)

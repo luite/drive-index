@@ -407,6 +407,10 @@ impl State {
                         }
                         None => stale = true,
                     }
+                    // Metadata still missing (first connect since the content phase
+                    // existed, an interrupted phase, or ffprobe installed since).
+                    stale |= crate::content::has_pending_media(catalog.conn(), fs, di_media::locate_tool("ffprobe").is_some())
+                        .unwrap_or(false);
                 }
                 let outcome = if stale { Outcome::Queued } else { Outcome::UpToDate { last_scan: oldest.unwrap_or(now) } };
                 (Some(drive_id), label, outcome)
@@ -454,6 +458,7 @@ impl State {
             after: self.opts.policy.after,
             identity: job.identity,
             allow_internal: false,
+            content: Some(crate::content::ContentConfig::default()),
         };
         let (progress, phase, ev) = (self.progress.clone(), self.phase.clone(), self.ev.clone());
         let releasing = Arc::new(AtomicBool::new(false));

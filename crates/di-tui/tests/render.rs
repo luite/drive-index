@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use di_scan::{PhaseCell, ResumeMode, ScanRequest, run_dir_scan};
 use di_tui::app::{App, Modal, Screen};
@@ -32,6 +32,7 @@ fn catalog_with_photos(tmp: &Path) -> std::path::PathBuf {
         label: Some("Photo Archive".into()),
         walk: WalkConfig { threads: 2, ..WalkConfig::default() },
         resume: ResumeMode::Auto,
+        content: None,
     };
     run_dir_scan(&req, &Control::default(), &Progress::default(), &PhaseCell::default()).unwrap();
     db
@@ -176,4 +177,76 @@ fn label_and_notes_dialogs_save() {
     key(&mut app, KeyCode::Enter);
     let s = render(&mut app, 140, 40);
     assert!(s.contains("Blue WD") && s.contains("shelf B"), "{s}");
+}
+
+fn click(app: &mut App, x: u16, y: u16) {
+    app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: KeyModifiers::NONE });
+}
+
+fn scroll(app: &mut App, down: bool) {
+    let kind = if down { MouseEventKind::ScrollDown } else { MouseEventKind::ScrollUp };
+    app.on_mouse(MouseEvent { kind, column: 10, row: 10, modifiers: KeyModifiers::NONE });
+}
+
+/// Position of `needle` in a rendered frame.
+fn find(frame: &str, needle: &str) -> (u16, u16) {
+    for (y, line) in frame.lines().enumerate() {
+        if let Some(b) = line.find(needle) {
+            return (line[..b].chars().count() as u16, y as u16);
+        }
+    }
+    panic!("{needle:?} not on screen:\n{frame}");
+}
+
+#[test]
+fn mouse_tabs_rows_double_click_and_scroll() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = catalog_with_photos(tmp.path());
+    let mut app = App::new(db, "test-host".into(), None, Some("t".into()));
+
+    // Click the "3 Browse" tab.
+    let frame = render(&mut app, 140, 40);
+    let (x, y) = find(&frame, "3 Browse");
+    click(&mut app, x + 2, y);
+    assert_eq!(app.screen, Screen::Browse);
+
+    // Double-click the filesystem row to open it, then a directory row.
+    let frame = render(&mut app, 140, 40);
+    let (x, y) = find(&frame, "D1.1");
+    click(&mut app, x, y);
+    click(&mut app, x, y);
+    assert!(app.browse.dir.is_some(), "double-click opened the filesystem");
+    let frame = render(&mut app, 140, 40);
+    let (x, y) = find(&frame, "Photos/");
+    click(&mut app, x, y);
+    assert_eq!(app.browse.entries[app.browse.sel].name, "Photos", "single click selects");
+    click(&mut app, x, y);
+    assert_eq!(app.browse.dir.as_ref().unwrap().path, "/Photos");
+
+    // Search results: click selects, double-click opens details, outside click closes.
+    key(&mut app, KeyCode::Char('/'));
+    type_text(&mut app, "ext:cr2");
+    wait(&mut app, |a| a.search.hits.len() == 2);
+    let frame = render(&mut app, 140, 40);
+    let (x, y) = find(&frame, "IMG_4412.CR2");
+    click(&mut app, x, y);
+    assert!(!app.search.focused);
+    assert_eq!(app.search.sel, 1);
+    click(&mut app, x, y);
+    assert!(matches!(app.modal, Some(Modal::File(_))));
+    render(&mut app, 140, 40);
+    click(&mut app, 0, 39);
+    assert!(app.modal.is_none(), "clicking outside the popup closes it");
+
+    // Clicking the query box focuses it again; the wheel moves the selection.
+    let frame = render(&mut app, 140, 40);
+    let (x, y) = find(&frame, "> ext:cr2");
+    click(&mut app, x + 3, y);
+    assert!(app.search.focused);
+    scroll(&mut app, true);
+    assert!(!app.search.focused);
+    assert_eq!(app.search.sel, 1, "scroll is clamped to the results");
+    scroll(&mut app, false);
+    assert_eq!(app.search.sel, 0);
+    assert!(!app.search.focused, "scrolling up does not jump into the query box");
 }

@@ -1,0 +1,17 @@
+[package]
+name = "di-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+blake3 = "1.8.7"
+di-model = { version = "0.1.0", path = "../di-model" }
+jiff = "0.2.45"
+libc = "0.2.191"
+lofty = "0.24.0"
+nom-exif = "3.8.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

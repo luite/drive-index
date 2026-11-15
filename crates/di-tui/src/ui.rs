@@ -16,7 +16,7 @@ use di_model::units::{format_count, format_duration, format_size};
 use di_scan::Phase;
 use di_scan::controller::Level;
 
-use crate::app::{App, ConnStatus, Modal, Screen};
+use crate::app::{App, ConnStatus, ListHit, ListKind, Modal, Screen};
 
 // -------------------------------------------------------------------------------------
 // Styling (16-colour safe, NO_COLOR respected)
@@ -92,6 +92,9 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [top, body, status, keys] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(5), Constraint::Length(1), Constraint::Length(1)]).areas(f.area());
+    app.hits.list = None;
+    app.hits.search_input = None;
+    app.hits.modal = None;
     draw_tabs(f, app, top);
     match app.screen {
         Screen::Drives => draw_drives(f, app, body),
@@ -119,10 +122,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
+fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     let mut spans = vec![Span::styled(" drive-index ", bold())];
+    let mut x = area.x + spans[0].width() as u16;
+    app.hits.tabs.clear();
+    app.hits.tabs_y = area.y;
     for (i, s) in Screen::ALL.iter().enumerate() {
         let label = format!(" {} {} ", i + 1, s.title());
+        let w = label.chars().count() as u16;
+        app.hits.tabs.push((x, x + w, *s));
+        x += w;
         spans.push(if *s == app.screen { Span::styled(label, selected().add_modifier(Modifier::BOLD)) } else { Span::raw(label) });
     }
     let online = app.connected.len();
@@ -226,6 +235,7 @@ fn draw_drives(f: &mut Frame, app: &mut App, area: Rect) {
         .block(block("Drives"));
     let mut state = TableState::default().with_selected((!empty).then_some(app.drive_sel));
     f.render_stateful_widget(table, list_area, &mut state);
+    app.hits.list = Some(ListHit { kind: ListKind::Drives, area: rows_area(list_area, true), offset: state.offset() });
     if empty {
         let hint = Paragraph::new("No drives yet. Connect one, or scan a directory with `drive-index scan DIR`.")
             .wrap(Wrap { trim: true })
@@ -384,6 +394,7 @@ fn draw_jobs(f: &mut Frame, app: &App, area: Rect) {
             Phase::Walking => "scanning",
             Phase::Aggregating => "totals",
             Phase::Merging => "merging",
+            Phase::Content => "reading metadata",
             _ => "preparing",
         }
     };
@@ -396,7 +407,12 @@ fn draw_jobs(f: &mut Frame, app: &App, area: Rect) {
         head,
     );
     let done = p.alloc_bytes.load(Ordering::Relaxed);
+    let (c_done, c_total) = (p.content_done.load(Ordering::Relaxed), p.content_total.load(Ordering::Relaxed));
     let (ratio, label) = match job.expected_bytes {
+        _ if phase == Phase::Content && c_total > 0 => (
+            (c_done as f64 / c_total as f64).min(1.0),
+            format!("metadata {}/{} files · {} read", format_count(c_done), format_count(c_total), format_size(p.content_bytes.load(Ordering::Relaxed))),
+        ),
         Some(total) if total > 0 && phase == Phase::Walking => {
             let r = (done as f64 / total as f64).min(0.99);
             (r, format!("{:.0}% of {} used", r * 100.0, format_size(total)))
@@ -462,6 +478,8 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
     );
     let b = block(title).border_style(if s.focused { fg(Color::Cyan) } else { Style::new() });
     f.render_widget(Paragraph::new(lines).block(b), input_area);
+    app.hits.search_input = Some(input_area);
+    let s = &app.search;
     if s.focused {
         let x = input_area.x + 3 + s.input.cursor() as u16;
         f.set_cursor_position((x.min(input_area.right().saturating_sub(2)), input_area.y + 1));
@@ -479,16 +497,22 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
                 }),
                 Cell::from(Line::from(format_size(h.size)).alignment(Alignment::Right)),
                 Cell::from(local_ns(h.mtime_ns)),
+                Cell::from(h.media.as_ref().map(|m| m.line()).unwrap_or_default()).style(dim()),
             ])
         })
         .collect();
     let n = rows.len();
-    let table = Table::new(rows, [Constraint::Length(16), Constraint::Min(20), Constraint::Length(10), Constraint::Length(16)])
-        .header(Row::new(vec!["Drive", "Path", "Size", "Modified"]).style(dim()))
+    let info_w = if s.hits.iter().any(|h| h.media.is_some()) { results_area.width.saturating_sub(70).clamp(0, 44) } else { 0 };
+    let table = Table::new(
+        rows,
+        [Constraint::Length(16), Constraint::Min(20), Constraint::Length(10), Constraint::Length(16), Constraint::Length(info_w)],
+    )
+        .header(Row::new(vec!["Drive", "Path", "Size", "Modified", "Info"]).style(dim()))
         .row_highlight_style(if s.focused { Style::new() } else { selected() })
         .block(block(format!("Results ({})", format_count(n as u64))));
     let mut state = TableState::default().with_selected((n > 0).then_some(s.sel));
     f.render_stateful_widget(table, results_area, &mut state);
+    app.hits.list = Some(ListHit { kind: ListKind::Results, area: rows_area(results_area, true), offset: state.offset() });
 }
 
 // -------------------------------------------------------------------------------------
@@ -512,6 +536,7 @@ fn draw_browse(f: &mut Frame, app: &mut App, area: Rect) {
             .block(block("Browse: pick a filesystem"));
         let mut state = TableState::default().with_selected((n > 0).then_some(b.fs_sel));
         f.render_stateful_widget(table, area, &mut state);
+        app.hits.list = Some(ListHit { kind: ListKind::BrowseFs, area: rows_area(area, true), offset: state.offset() });
         return;
     };
     let fs = b.filesystems.iter().find(|x| x.fs_id == dir.filesystem_id);
@@ -564,6 +589,13 @@ fn draw_browse(f: &mut Frame, app: &mut App, area: Rect) {
     .block(block(title));
     let mut state = TableState::default().with_selected((n > 0).then_some(b.sel));
     f.render_stateful_widget(table, area, &mut state);
+    app.hits.list = Some(ListHit { kind: ListKind::BrowseEntries, area: rows_area(area, false), offset: state.offset() });
+}
+
+/// Data rows of a bordered table (minus the header row, if any).
+fn rows_area(area: Rect, header: bool) -> Rect {
+    let top = 1 + header as u16;
+    Rect { x: area.x + 1, y: area.y + top, width: area.width.saturating_sub(2), height: area.height.saturating_sub(top + 1) }
 }
 
 // -------------------------------------------------------------------------------------
@@ -650,9 +682,14 @@ fn draw_setup(f: &mut Frame, app: &App, area: Rect) {
 // Modals
 // -------------------------------------------------------------------------------------
 
-fn draw_modal(f: &mut Frame, app: &App) {
+fn draw_modal(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let Some(modal) = &app.modal else { return };
+    let Some(modal) = app.modal.take() else { return };
+    draw_modal_inner(f, app, area, &modal);
+    app.modal = Some(modal);
+}
+
+fn draw_modal_inner(f: &mut Frame, app: &mut App, area: Rect, modal: &Modal) {
     let (title, lines, w, h): (String, Vec<Line>, u16, u16) = match modal {
         Modal::Help => (
             "Help".into(),
@@ -739,14 +776,24 @@ fn draw_modal(f: &mut Frame, app: &App) {
                 kv("Link", d.link_target.clone().unwrap_or_else(|| "-".into())),
                 kv("Scanned", local_time(d.scanned_at)),
                 kv("Mounted", d.mount_point.clone().unwrap_or_else(|| "-".into())),
-                Line::raw(""),
-                Line::styled("c copy path   esc close", dim()),
+                kv("Hash", d.quick_hash.as_ref().map(|h| format!("{h} (quick)")).unwrap_or_else(|| "-".into())),
             ];
-            ("File".into(), lines, 100, 19)
+            let mut lines = lines;
+            if let Some(m) = &d.media {
+                lines.push(Line::raw(""));
+                for (k, v) in m.lines() {
+                    lines.push(kv(k, v));
+                }
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("c copy path   esc close", dim()));
+            let h = lines.len() as u16 + 2;
+            ("File".into(), lines, 100, h)
         }
     };
     let r = centered(area, w, h);
     f.render_widget(Clear, r);
+    app.hits.modal = Some(r);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block(title)), r);
     if let Modal::Label { input, .. } | Modal::Notes { input, .. } = modal {
         f.set_cursor_position((r.x + 3 + input.cursor() as u16, r.y + 1));

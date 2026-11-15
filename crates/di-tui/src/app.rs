@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 
 use di_core::Catalog;
 use di_core::catalog::DriveSummary;
@@ -94,6 +95,33 @@ pub enum Modal {
     File(Box<FileDetail>),
 }
 
+/// Where things were drawn in the last frame, for mapping mouse clicks.
+#[derive(Debug, Clone, Default)]
+pub struct Hits {
+    pub tabs_y: u16,
+    /// (x start, x end exclusive, screen)
+    pub tabs: Vec<(u16, u16, Screen)>,
+    pub list: Option<ListHit>,
+    pub search_input: Option<Rect>,
+    pub modal: Option<Rect>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListKind {
+    Drives,
+    Results,
+    BrowseFs,
+    BrowseEntries,
+}
+
+/// A table's data rows on screen.
+#[derive(Debug, Clone, Copy)]
+pub struct ListHit {
+    pub kind: ListKind,
+    pub area: Rect,
+    pub offset: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct LogLine {
     pub at: i64,
@@ -163,6 +191,8 @@ pub struct App {
     pub modal: Option<Modal>,
     pub toast: Option<(String, Instant)>,
     pub quit: bool,
+    pub hits: Hits,
+    last_click: Option<(Instant, ListKind, usize)>,
     last_refresh: Instant,
 }
 
@@ -213,6 +243,8 @@ impl App {
             modal: None,
             toast: None,
             quit: false,
+            hits: Hits::default(),
+            last_click: None,
             last_refresh: Instant::now() - Duration::from_secs(60),
         };
         app.load_log();
@@ -610,6 +642,87 @@ impl App {
             Screen::Search => self.search_key(key),
             Screen::Browse => self.browse_key(key),
             Screen::Setup => self.setup_key(key),
+            _ => {}
+        }
+    }
+
+    fn list_len(&self, kind: ListKind) -> usize {
+        match kind {
+            ListKind::Drives => self.drives.len(),
+            ListKind::Results => self.search.hits.len(),
+            ListKind::BrowseFs => self.browse.filesystems.len(),
+            ListKind::BrowseEntries => self.browse.entries.len(),
+        }
+    }
+
+    fn set_selection(&mut self, kind: ListKind, i: usize) {
+        match kind {
+            ListKind::Drives => {
+                self.drive_sel = i;
+                self.refresh();
+            }
+            ListKind::Results => {
+                self.search.focused = false;
+                self.search.sel = i;
+            }
+            ListKind::BrowseFs => self.browse.fs_sel = i,
+            ListKind::BrowseEntries => self.browse.sel = i,
+        }
+    }
+
+    pub fn on_mouse(&mut self, m: MouseEvent) {
+        let (x, y) = (m.column, m.row);
+        let inside = |r: Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+        match m.kind {
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                if self.modal.is_some() {
+                    return;
+                }
+                let code = if m.kind == MouseEventKind::ScrollDown { KeyCode::Down } else { KeyCode::Up };
+                if self.screen == Screen::Search {
+                    self.search.focused = false;
+                }
+                for _ in 0..3 {
+                    // Scrolling up past the first result must not jump into the query box.
+                    if self.screen == Screen::Search && code == KeyCode::Up && self.search.sel == 0 {
+                        break;
+                    }
+                    self.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(modal) = self.hits.modal {
+                    // Clicking outside an informational popup closes it.
+                    if !inside(modal) && matches!(self.modal, Some(Modal::Help) | Some(Modal::File(_))) {
+                        self.modal = None;
+                    }
+                    return;
+                }
+                if y == self.hits.tabs_y {
+                    if let Some(&(_, _, screen)) = self.hits.tabs.iter().find(|(a, b, _)| x >= *a && x < *b) {
+                        self.screen = screen;
+                    }
+                    return;
+                }
+                if self.screen == Screen::Search && self.hits.search_input.is_some_and(inside) {
+                    self.search.focused = true;
+                    return;
+                }
+                let Some(list) = self.hits.list.filter(|l| inside(l.area)) else { return };
+                let i = list.offset + (y - list.area.y) as usize;
+                if i >= self.list_len(list.kind) {
+                    return;
+                }
+                self.set_selection(list.kind, i);
+                let double = self
+                    .last_click
+                    .is_some_and(|(t, k, j)| k == list.kind && j == i && t.elapsed() < Duration::from_millis(450));
+                self.last_click = Some((Instant::now(), list.kind, i));
+                if double {
+                    self.last_click = None;
+                    self.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
+            }
             _ => {}
         }
     }

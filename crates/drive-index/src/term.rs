@@ -122,7 +122,7 @@ fn progress_loop(p: &Progress, phase: &PhaseCell, stop: &AtomicBool, printer: &P
     let mut drawn = false;
     while !stop.load(Ordering::SeqCst) {
         let ph = phase.get();
-        let active = matches!(ph, Phase::Walking | Phase::Aggregating | Phase::Merging);
+        let active = matches!(ph, Phase::Walking | Phase::Aggregating | Phase::Merging | Phase::Content);
         let _g = printer.lock.lock().unwrap();
         let mut err = std::io::stderr();
         if !active {
@@ -145,11 +145,29 @@ fn progress_loop(p: &Progress, phase: &PhaseCell, stop: &AtomicBool, printer: &P
             }
             let cancelled = current.lock().unwrap().is_cancelled();
             let label = match ph {
-                Phase::Walking if cancelled => "stopping",
+                Phase::Walking | Phase::Content if cancelled => "stopping",
                 Phase::Walking => "scanning",
                 Phase::Aggregating => "totals",
+                Phase::Content => "metadata",
                 _ => "merging",
             };
+            if ph == Phase::Content {
+                let head = format!(
+                    "{label:<9} {}/{} files  {} read  {}  ",
+                    format_count(p.content_done.load(Ordering::Relaxed)),
+                    format_count(p.content_total.load(Ordering::Relaxed)),
+                    format_size(p.content_bytes.load(Ordering::Relaxed)),
+                    format_duration(start.elapsed()),
+                );
+                let room = terminal_width().saturating_sub(head.chars().count() + 1);
+                let path = if room > 10 { tail(&p.current_path(), room) } else { String::new() };
+                let _ = write!(err, "\r\x1b[2K{head}{path}");
+                let _ = err.flush();
+                drawn = true;
+                drop(_g);
+                std::thread::sleep(Duration::from_millis(150));
+                continue;
+            }
             let head = format!(
                 "{label:<9} {} files  {} dirs  {}  {}/s  {}  ",
                 format_count(files),

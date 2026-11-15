@@ -79,12 +79,30 @@ pub struct Progress {
     pub errors: AtomicU64,
     /// Workers currently listing a directory (0 while paused or idle).
     pub busy_workers: AtomicUsize,
+    /// Content phase (hashes + media metadata): files to process / done / bytes read.
+    pub content_total: AtomicU64,
+    pub content_done: AtomicU64,
+    pub content_bytes: AtomicU64,
     current: Mutex<String>,
 }
 
 impl Progress {
     pub fn current_path(&self) -> String {
         self.current.lock().unwrap().clone()
+    }
+
+    pub fn set_current(&self, path: &str) {
+        if let Ok(mut cur) = self.current.try_lock() {
+            cur.clear();
+            cur.push_str(path);
+        }
+    }
+
+    /// Zero all counters (between filesystems of one drive).
+    pub fn reset(&self) {
+        for a in [&self.files, &self.dirs, &self.bytes, &self.alloc_bytes, &self.errors, &self.content_total, &self.content_done, &self.content_bytes] {
+            a.store(0, Ordering::Relaxed);
+        }
     }
 }
 

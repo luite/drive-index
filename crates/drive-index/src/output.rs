@@ -44,20 +44,31 @@ pub fn print_hits(hits: &[Hit]) {
         println!("No matches.");
         return;
     }
-    println!("{:<18} {:>10}  {:<16}  PATH", "DRIVE", "SIZE", "MODIFIED");
+    let info = hits.iter().any(|h| h.media.is_some());
+    if info {
+        println!("{:<18} {:>10}  {:<16}  {:<40}  PATH", "DRIVE", "SIZE", "MODIFIED", "INFO");
+    } else {
+        println!("{:<18} {:>10}  {:<16}  PATH", "DRIVE", "SIZE", "MODIFIED");
+    }
     for h in hits {
         let drive = format!("D{} {}", h.drive_id, h.drive_label.as_deref().unwrap_or(""));
         let path = match &h.link_target {
             Some(t) => format!("{} -> {}", h.path, t),
             None => h.path.clone(),
         };
-        println!(
-            "{:<18} {:>10}  {:<16}  {}",
-            clip(&drive, 18),
-            format_size(h.size),
-            local_ns(h.mtime_ns),
-            path
-        );
+        if info {
+            let line = h.media.as_ref().map(|m| m.line()).unwrap_or_default();
+            println!(
+                "{:<18} {:>10}  {:<16}  {:<40}  {}",
+                clip(&drive, 18),
+                format_size(h.size),
+                local_ns(h.mtime_ns),
+                clip(&line, 40),
+                path
+            );
+        } else {
+            println!("{:<18} {:>10}  {:<16}  {}", clip(&drive, 18), format_size(h.size), local_ns(h.mtime_ns), path);
+        }
     }
 }
 

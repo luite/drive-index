@@ -18,6 +18,7 @@ fn request(db: &Path, dir: &Path) -> ScanRequest {
         label: Some("Test Drive".into()),
         walk: WalkConfig { threads: 4, ..WalkConfig::default() },
         resume: ResumeMode::Auto,
+        content: None,
     }
 }
 
@@ -95,7 +96,7 @@ fn scan_search_rescan() {
     assert_eq!((summary.files, summary.bytes), (3, 77_000));
 
     // Errors are reported, not panics.
-    let req = SearchRequest { query: "camera:canon", sort: SortKey::Path, descending: false, limit: 10, offset: 0 };
+    let req = SearchRequest { query: "dup:yes", sort: SortKey::Path, descending: false, limit: 10, offset: 0 };
     assert!(search(cat.conn(), &req).unwrap_err().to_string().contains("not built yet"));
 
     // Aggregates: root totals equal the scan totals.
@@ -246,4 +247,61 @@ fn hardlinks_counted_once() {
     let out = scan(&db, &data);
     assert_eq!(out.totals.files, 2);
     assert_eq!(out.totals.bytes, 50_000);
+}
+
+#[test]
+fn content_phase_extracts_media_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("index.db");
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../di-media/tests/fixtures");
+    let data = tmp.path().join("media");
+    fs::create_dir_all(&data).unwrap();
+    for e in fs::read_dir(&fixtures).unwrap() {
+        let e = e.unwrap();
+        fs::copy(e.path(), data.join(e.file_name())).unwrap();
+    }
+    // A duplicate candidate: two identical non-media files of 2 MiB.
+    write(&data.join("big1.bin"), 2 << 20);
+    write(&data.join("big2.bin"), 2 << 20);
+
+    let mut req = request(&db, &data);
+    req.content = Some(di_scan::content::ContentConfig { ffprobe: None, exiftool: None, ..Default::default() });
+    let out = run_dir_scan(&req, &Control::default(), &Progress::default(), &PhaseCell::default()).unwrap();
+    let c = out.content.unwrap();
+    assert_eq!(c.media, 9, "{c:?}");
+    assert_eq!(c.hashed, 11, "9 media files + 2 duplicate candidates");
+    assert_eq!(c.errors, 0);
+
+    let cat = Catalog::open_readonly(&db).unwrap();
+    for (q, n) in [
+        ("taken:2014-07", 1),
+        ("camera:canon", 1),
+        ("camera:\"iphone*\"", 1),
+        ("camera:\"EOS 5D*\"", 1),
+        ("gps:yes", 4),
+        ("artist:testers", 1),
+        ("year:<2000", 1),
+        ("duration:>1500ms", 2),
+        ("res:>=320x240", 3),
+        ("media:none", 2),
+        ("media:partial", 3),
+    ] {
+        assert_eq!(paths(&cat, q).len(), n, "query {q}");
+    }
+    let same: i64 = cat
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM file_hashes a JOIN file_hashes b ON a.quick = b.quick AND a.file_id < b.file_id",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(same, 1, "the two identical files share a quick hash");
+    drop(cat);
+
+    // Rescan: unchanged files keep their rows, nothing is read again.
+    let again = run_dir_scan(&req, &Control::default(), &Progress::default(), &PhaseCell::default()).unwrap();
+    assert_eq!(again.content.unwrap().processed, 0);
+    assert_eq!(again.merge.media_carried, 9);
+    assert_eq!(again.merge.hashes_carried, 11);
 }
