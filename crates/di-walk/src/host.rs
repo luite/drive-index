@@ -6,16 +6,35 @@ use std::path::Path;
 
 use di_model::FsUsage;
 
+/// This host's name as recorded in the catalog: a *stable* short name. Network-
+/// assigned names (`Mac.fritz.box`, `Mac.local`) change with the network, so macOS
+/// uses its LocalHostName and everything else drops the domain part.
+/// `DRIVE_INDEX_HOST` overrides it (for testing multi-host workflows on one machine).
 pub fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if rc != 0 {
-        return "unknown-host".into();
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Ok(h) = std::env::var("DRIVE_INDEX_HOST") {
+        if !h.is_empty() {
+            return h;
+        }
     }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    let name = String::from_utf8_lossy(&buf[..end]).into_owned();
-    // Strip a trailing ".local" (macOS) so the same machine has one stable name.
-    name.strip_suffix(".local").map(str::to_owned).unwrap_or(name)
+    CACHE.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        if let Ok(out) = std::process::Command::new("/usr/sbin/scutil").args(["--get", "LocalHostName"]).output() {
+            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if out.status.success() && !name.is_empty() {
+                return name;
+            }
+        }
+        let mut buf = [0u8; 256];
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if rc != 0 {
+            return "unknown-host".into();
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let name = String::from_utf8_lossy(&buf[..end]).into_owned();
+        name.split('.').next().filter(|s| !s.is_empty()).unwrap_or("unknown-host").to_string()
+    })
+    .clone()
 }
 
 /// IANA time zone name of this host, best effort (`TZ`, then `/etc/localtime`).

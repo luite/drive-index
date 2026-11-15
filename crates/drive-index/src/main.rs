@@ -1,6 +1,7 @@
 //! drive-index command-line interface (PLAN.md §8). The TUI (M3) will become the
 //! default command; until then running without a subcommand prints help.
 
+mod catalog_cmd;
 mod output;
 mod scan_cmd;
 mod term;
@@ -14,6 +15,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
+use catalog_cmd::SessionGuard;
 use di_core::Catalog;
 use di_core::search::{SearchError, SearchRequest, SortKey, search, summarize};
 use di_scan::device::{DeviceScanRequest, IdentityChoice};
@@ -26,6 +28,10 @@ struct Cli {
     /// Catalog database [default: platform data directory]
     #[arg(long, global = true, env = "DRIVE_INDEX_DB", value_name = "PATH")]
     db: Option<PathBuf>,
+
+    /// Write to a catalog even though it is an older copy than this host has seen
+    #[arg(long, global = true)]
+    accept_stale: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -142,6 +148,37 @@ enum Command {
         #[arg(long, conflicts_with = "label")]
         clear: bool,
     },
+    /// Check external tools, drivers and permissions, with install hints
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Catalog maintenance and moving it between hosts
+    Db {
+        #[command(subcommand)]
+        cmd: DbCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbCmd {
+    /// Catalog id, size, sessions per host, and whether it is safe to copy
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a consistent copy for moving the catalog to another host
+    Handoff {
+        /// File or directory [default: current directory]
+        dest: Option<PathBuf>,
+    },
+    /// Replace the local catalog with a copy from another host (keeps a backup)
+    Import {
+        file: PathBuf,
+        /// Replace even if the local catalog has work the copy lacks
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -206,6 +243,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
     let db = catalog_path(cli.db)?;
+    let accept_stale = cli.accept_stale;
     match command {
         Command::Scan {
             target,
@@ -240,10 +278,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     identity,
                     allow_internal,
                 };
-                scan_cmd::scan_device(&req, quiet)
+                let session = SessionGuard::begin(&req.catalog_path, accept_stale)?;
+                let code = scan_cmd::scan_device(&req, quiet)?;
+                session.end()?;
+                Ok(code)
             } else {
                 let req = ScanRequest { catalog_path: db, dir: PathBuf::from(target), label, walk, resume };
-                scan_cmd::scan_dir(&req, quiet)
+                let session = SessionGuard::begin(&req.catalog_path, accept_stale)?;
+                let code = scan_cmd::scan_dir(&req, quiet)?;
+                session.end()?;
+                Ok(code)
             }
         }
         Command::Watch { scan_new, rescan_after, include_images, after, threads, quiet } => {
@@ -256,7 +300,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 walk: walk_config(threads)?,
                 quiet,
             };
-            watch::run(&opts)
+            let session = SessionGuard::begin(&opts.catalog_path, accept_stale)?;
+            let code = watch::run(&opts)?;
+            session.end()?;
+            Ok(code)
         }
         Command::Search { query, limit, sort, desc, count, json } => {
             let query = query.join(" ");
@@ -279,8 +326,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
             if label.is_none() && !clear {
                 bail!("give a label, or --clear to remove it");
             }
+            let session = SessionGuard::begin(&db, accept_stale)?;
             let cat = Catalog::open(&db)?;
-            if !cat.set_drive_label(id, label.as_deref())? {
+            let changed = cat.set_drive_label(id, label.as_deref())?;
+            drop(cat);
+            session.end()?;
+            if !changed {
                 bail!("no drive D{id} (see `drive-index list`)");
             }
             match label {
@@ -289,6 +340,20 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Doctor { json } => {
+            let report = di_doctor::run_checks(&di_walk::host::hostname());
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                output::print_doctor(&report, &db, &catalog_cmd::state_path()?);
+            }
+            Ok(if report.essential_failures() > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS })
+        }
+        Command::Db { cmd } => match cmd {
+            DbCmd::Status { json } => catalog_cmd::status(&db, json),
+            DbCmd::Handoff { dest } => catalog_cmd::handoff(&db, dest),
+            DbCmd::Import { file, force } => catalog_cmd::import(&db, &file, force),
+        },
     }
 }
 

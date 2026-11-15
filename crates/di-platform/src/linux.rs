@@ -10,7 +10,7 @@ use zbus::blocking::Connection;
 use zbus::blocking::fdo::ObjectManagerProxy;
 use zbus::zvariant::{OwnedValue, Value};
 
-use crate::{Bus, DeviceEvent, DriveProbe, Medium, PartitionProbe, UsbInfo, VolumeProbe};
+use crate::{AuthAnswer, Bus, DeviceEvent, DriveProbe, Medium, PartitionProbe, UsbInfo, VolumeProbe};
 
 const DEST: &str = "org.freedesktop.UDisks2";
 const ROOT: &str = "/org/freedesktop/UDisks2";
@@ -599,4 +599,56 @@ pub fn watch() -> Result<Receiver<DeviceEvent>> {
         }
     })?;
     Ok(rx)
+}
+
+pub fn udisks_version() -> Result<String> {
+    let conn = connect()?;
+    let reply = conn.call_method(
+        Some(DEST),
+        "/org/freedesktop/UDisks2/Manager",
+        Some("org.freedesktop.DBus.Properties"),
+        "Get",
+        &("org.freedesktop.UDisks2.Manager", "Version"),
+    )?;
+    let v: OwnedValue = reply.body().deserialize()?;
+    match &*v {
+        Value::Str(s) => Ok(s.as_str().to_string()),
+        other => Ok(format!("{other:?}")),
+    }
+}
+
+/// Process start time in clock ticks since boot (field 22 of /proc/self/stat), as
+/// polkit's unix-process subject requires.
+fn proc_start_time() -> Result<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat")?;
+    let after_comm = stat.rsplit_once(')').map(|(_, r)| r).context("bad /proc/self/stat")?;
+    after_comm
+        .split_whitespace()
+        .nth(19)
+        .and_then(|f| f.parse().ok())
+        .context("no start time in /proc/self/stat")
+}
+
+pub fn polkit_check(action: &str) -> Result<AuthAnswer> {
+    let conn = connect()?;
+    let subject = (
+        "unix-process",
+        HashMap::from([("pid", Value::from(std::process::id())), ("start-time", Value::from(proc_start_time()?))]),
+    );
+    let details: HashMap<&str, &str> = HashMap::new();
+    let reply = conn.call_method(
+        Some("org.freedesktop.PolicyKit1"),
+        "/org/freedesktop/PolicyKit1/Authority",
+        Some("org.freedesktop.PolicyKit1.Authority"),
+        "CheckAuthorization",
+        &(subject, action, details, 0u32, ""),
+    )?;
+    let (authorized, challenge, _details): (bool, bool, HashMap<String, String>) = reply.body().deserialize()?;
+    Ok(if authorized {
+        AuthAnswer::Yes
+    } else if challenge {
+        AuthAnswer::NeedsAuthentication
+    } else {
+        AuthAnswer::No
+    })
 }

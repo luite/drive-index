@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::seed;
 pub use di_model::FsUsage;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub struct Catalog {
     conn: Connection,
@@ -50,11 +50,17 @@ impl Catalog {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-131072;")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != SCHEMA_VERSION {
+        if version > SCHEMA_VERSION {
             bail!(
-                "catalog {} has schema version {version}, this build expects {SCHEMA_VERSION}; open it read-write once to migrate",
+                "catalog {} has schema version {version}, newer than this build ({SCHEMA_VERSION}); upgrade drive-index",
                 path.display()
             );
+        }
+        if version < SCHEMA_VERSION {
+            // Migrate once through a read-write connection, then reopen read-only.
+            drop(conn);
+            drop(Catalog::open(path)?);
+            return Catalog::open_readonly(path);
         }
         Ok(Catalog { conn, path: path.to_path_buf() })
     }
@@ -386,7 +392,19 @@ fn migrate(conn: &Connection) -> Result<()> {
             "INSERT INTO meta (key, value) VALUES ('catalog_id', ?1), ('created_at', ?2)",
             params![random_id(), now_secs().to_string()],
         )?;
-        tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+        tx.execute_batch("PRAGMA user_version = 1;")?;
+        tx.commit()?;
+    }
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < 2 {
+        // v2: session process ids (to tell crashed sessions from live ones) and the
+        // last scan id when the session began (to count the session's own scans).
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN pid INTEGER;
+             ALTER TABLE sessions ADD COLUMN first_scan_id INTEGER;
+             PRAGMA user_version = 2;",
+        )?;
         tx.commit()?;
     }
     Ok(())

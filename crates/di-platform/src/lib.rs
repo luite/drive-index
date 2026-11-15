@@ -12,8 +12,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 pub mod identity;
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-mod util;
+pub mod util;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -233,5 +232,26 @@ pub fn watch() -> anyhow::Result<std::sync::mpsc::Receiver<DeviceEvent>> {
 }
 
 /// Default timeout for external commands (diskutil, …).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) const CMD_TIMEOUT: Duration = Duration::from_secs(60);
+pub const CMD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Answer from the platform's authorization service for an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum AuthAnswer {
+    Yes,
+    /// Allowed after the user authenticates (works in a desktop session, not over SSH).
+    NeedsAuthentication,
+    No,
+}
+
+/// udisks2 daemon version (Linux).
+#[cfg(target_os = "linux")]
+pub fn udisks_version() -> anyhow::Result<String> {
+    linux::udisks_version()
+}
+
+/// Would polkit allow this process to perform `action` (e.g.
+/// `org.freedesktop.udisks2.filesystem-mount`) without asking? (Linux)
+#[cfg(target_os = "linux")]
+pub fn polkit_check(action: &str) -> anyhow::Result<AuthAnswer> {
+    linux::polkit_check(action)
+}

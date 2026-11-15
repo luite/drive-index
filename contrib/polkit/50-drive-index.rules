@@ -1,0 +1,23 @@
+// Allow members of the "plugdev" group to mount, unmount, set up loop devices and
+// power off drives through udisks2 without a password prompt, including over SSH,
+// so `drive-index scan` and `watch` work there. Formatting and other destructive
+// actions are NOT included.
+//
+// Install:  sudo cp 50-drive-index.rules /etc/polkit-1/rules.d/
+// (takes effect immediately; check with `drive-index doctor`)
+polkit.addRule(function(action, subject) {
+    var allowed = [
+        "org.freedesktop.udisks2.filesystem-mount",
+        "org.freedesktop.udisks2.filesystem-mount-other-seat",
+        "org.freedesktop.udisks2.filesystem-unmount-others",
+        "org.freedesktop.udisks2.loop-setup",
+        "org.freedesktop.udisks2.loop-delete-others",
+        "org.freedesktop.udisks2.power-off-drive",
+        "org.freedesktop.udisks2.power-off-drive-other-seat",
+        "org.freedesktop.udisks2.eject-media",
+        "org.freedesktop.udisks2.eject-media-other-seat"
+    ];
+    if (subject.isInGroup("plugdev") && allowed.indexOf(action.id) >= 0) {
+        return polkit.Result.YES;
+    }
+});

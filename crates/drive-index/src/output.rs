@@ -29,6 +29,10 @@ fn local_ns(ns: Option<i64>) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
+pub fn local_time(s: Option<i64>) -> String {
+    local_secs(s)
+}
+
 fn local_secs(s: Option<i64>) -> String {
     local_ns(s.map(|s| s.saturating_mul(1_000_000_000)))
 }
@@ -236,4 +240,46 @@ pub fn print_probe(p: &di_platform::DriveProbe) {
         println!("  identifiers: {}", list.join("  "));
     }
     println!();
+}
+
+pub fn print_doctor(r: &di_doctor::Report, db: &std::path::Path, state: &std::path::Path) {
+    use di_doctor::Status;
+    println!(
+        "drive-index doctor — {} · {} · running as {}{}",
+        r.host,
+        r.os,
+        if r.running_as_root { "root" } else { "a normal user" },
+        r.installer.as_ref().map(|i| format!(" · package manager: {i}")).unwrap_or_default()
+    );
+    println!();
+    println!("{:<20} {:<12} {:<10} ENABLES", "COMPONENT", "STATUS", "VERSION");
+    for c in &r.checks {
+        let status = match c.status {
+            Status::Ok => "✔ ok",
+            Status::Warn => "⚠ warning",
+            Status::Missing => "✖ missing",
+            Status::Error => "✖ error",
+            Status::Info => "· info",
+        };
+        println!(
+            "{:<20} {:<12} {:<10} {}",
+            c.name,
+            status,
+            clip(c.version.as_deref().unwrap_or("-"), 10),
+            c.enables
+        );
+        if let Some(d) = &c.detail {
+            println!("{:<20} {d}", "");
+        }
+        if let Some(f) = c.fix.as_ref().filter(|_| c.status != Status::Ok) {
+            println!("{:<20} fix: {f}", "");
+        }
+    }
+    println!();
+    if let Some(cmd) = &r.install_command {
+        println!("Install everything missing:  {cmd}");
+    }
+    let size = std::fs::metadata(db).map(|m| format_size(m.len())).unwrap_or_else(|_| "not created yet".into());
+    println!("Catalog: {} ({size})", db.display());
+    println!("Host state: {}", state.display());
 }
