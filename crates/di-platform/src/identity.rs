@@ -64,7 +64,15 @@ pub fn identifiers(d: &DriveProbe) -> Vec<Identifier> {
         }
     }
     for v in &d.volumes {
-        if let Some(u) = &v.fs_uuid {
+        // EFI system partitions are formatted with fixed serials, so many drives share
+        // their UUID (e.g. macOS's 0E239BC6-…); they identify nothing.
+        let efi = v.partition_number.is_some_and(|n| {
+            d.partitions.iter().any(|p| {
+                p.number == n
+                    && p.type_name.as_deref().is_some_and(|t| t.eq_ignore_ascii_case("EFI") || t == "EFI System")
+            })
+        });
+        if let Some(u) = v.fs_uuid.as_ref().filter(|_| !efi) {
             push("fs_uuid", u.to_ascii_uppercase(), FS_UUID);
         }
     }

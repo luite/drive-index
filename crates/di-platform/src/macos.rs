@@ -442,7 +442,8 @@ impl IoregInfo {
         if let Some(path) = ioreg_path("IOUSBHostDevice", bsd) {
             if let Some(dev) = path.first() {
                 let num = |k: &str| u(dev, k).map(|v| v as u16);
-                let speed = u(dev, "Device Speed").or_else(|| u(dev, "UsbDeviceSpeed")).map(|code| match code {
+                let link = u(dev, "UsbLinkSpeed").map(|bps| (bps / 1_000_000) as u32).filter(|&m| m > 0);
+                let speed = link.or_else(|| u(dev, "Device Speed").or_else(|| u(dev, "UsbDeviceSpeed")).map(|code| match code {
                     0 => 1,
                     1 => 12,
                     2 => 480,
@@ -450,7 +451,7 @@ impl IoregInfo {
                     4 => 10000,
                     5 => 20000,
                     n => n as u32,
-                });
+                }));
                 out.usb = Some(UsbInfo {
                     vendor_id: num("idVendor"),
                     product_id: num("idProduct"),

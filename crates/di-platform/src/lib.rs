@@ -187,7 +187,28 @@ pub fn resolve_whole(dev: &str) -> anyhow::Result<String> {
 /// Describe one whole disk (accepts `disk7`, `/dev/disk7`, `sdb`, `/dev/sdb`, or any
 /// partition/volume of it).
 pub fn probe(dev: &str) -> anyhow::Result<DriveProbe> {
-    sys::probe(dev)
+    let mut p = sys::probe(dev)?;
+    mark_efi(&mut p);
+    Ok(p)
+}
+
+/// EFI system partitions hold boot files, not user data, and the empty ones Disk
+/// Utility creates often refuse to mount: record them, but don't scan them.
+fn mark_efi(p: &mut DriveProbe) {
+    let efi: Vec<u32> = p
+        .partitions
+        .iter()
+        .filter(|x| {
+            let name = x.type_name.as_deref().unwrap_or("");
+            name.eq_ignore_ascii_case("EFI") || name == "EFI System"
+        })
+        .map(|x| x.number)
+        .collect();
+    for v in &mut p.volumes {
+        if v.unscannable_reason.is_none() && v.partition_number.is_some_and(|n| efi.contains(&n)) {
+            v.unscannable_reason = Some("EFI system partition (boot files, not user data)".into());
+        }
+    }
 }
 
 /// Mount a volume read-only (and hidden from Finder on macOS). Returns the mount point.

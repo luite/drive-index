@@ -144,5 +144,12 @@ pub fn scan_device(req: &DeviceScanRequest, quiet: bool) -> Result<ExitCode> {
     term.finish();
     let report = result?;
     summarize(&printer, &report);
-    Ok(if report.interrupted { ExitCode::from(130) } else { ExitCode::SUCCESS })
+    let failed = report.volumes.iter().any(|v| matches!(v.outcome, VolumeOutcome::Failed(_)));
+    Ok(if report.interrupted {
+        ExitCode::from(130)
+    } else if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
