@@ -1,6 +1,7 @@
 //! The drive-index catalog: SQLite schema, bookkeeping and the search language.
 
 pub mod catalog;
+pub mod drives;
 pub mod query;
 pub mod search;
 mod seed;

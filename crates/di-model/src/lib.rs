@@ -4,7 +4,9 @@
 //! including the platform walker that is type-checked for foreign targets, can use it.
 
 pub mod flags;
+pub mod identity;
 pub mod names;
+pub mod parttypes;
 pub mod units;
 
 /// Type and usage of a mounted filesystem (from statfs/statvfs).

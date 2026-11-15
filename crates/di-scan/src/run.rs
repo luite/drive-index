@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 
-use di_core::{Catalog, DirSource, NewScan};
+use di_core::{Catalog, DirSource, NewScan, SourceIds};
 use di_walk::{Control, DirBatch, Progress, WalkConfig, WalkOutcome, best_lister, stat_path, walk};
 
 use di_walk::host;
@@ -87,7 +87,7 @@ pub fn run_dir_scan(req: &ScanRequest, control: &Control, progress: &Progress, p
         .dir
         .canonicalize()
         .with_context(|| format!("cannot access {}", req.dir.display()))?;
-    let (kind, root_meta) = stat_path(&root)?;
+    let (kind, _) = stat_path(&root)?;
     if kind != di_walk::EntryKind::Dir {
         bail!("{} is not a directory", root.display());
     }
@@ -96,11 +96,44 @@ pub fn run_dir_scan(req: &ScanRequest, control: &Control, progress: &Progress, p
 
     let mut catalog = Catalog::open(&req.catalog_path)?;
     let ids = catalog.upsert_dir_source(&DirSource {
-        host: host.clone(),
-        path: root_str.clone(),
+        host,
+        path: root_str,
         label: req.label.clone(),
         fs: host::fs_usage(&root),
     })?;
+    let target = FsTarget { drive_id: ids.drive_id, filesystem_id: ids.filesystem_id, root };
+    run_fs_scan(&mut catalog, &target, &req.walk, req.resume, control, progress, phase)
+}
+
+/// A filesystem in the catalog and where it is mounted right now.
+#[derive(Debug, Clone)]
+pub struct FsTarget {
+    pub drive_id: i64,
+    pub filesystem_id: i64,
+    /// Canonical mount point / directory to walk.
+    pub root: PathBuf,
+}
+
+/// Scan one catalog filesystem at `target.root`: staging, walk, aggregates, merge.
+/// Resumes an interrupted scan of the same filesystem unless `resume` is Restart.
+pub fn run_fs_scan(
+    catalog: &mut Catalog,
+    target: &FsTarget,
+    walk_cfg: &WalkConfig,
+    resume: ResumeMode,
+    control: &Control,
+    progress: &Progress,
+    phase: &PhaseCell,
+) -> Result<ScanOutcome> {
+    phase.set(Phase::Preparing);
+    let root = &target.root;
+    let (kind, root_meta) = stat_path(root)?;
+    if kind != di_walk::EntryKind::Dir {
+        bail!("{} is not a directory", root.display());
+    }
+    let root_str = root.to_str().context("scan path is not valid UTF-8")?.to_string();
+    let host = host::hostname();
+    let ids = SourceIds { drive_id: target.drive_id, filesystem_id: target.filesystem_id };
 
     let lister = best_lister();
     let staging_dir = catalog.staging_dir();
@@ -111,7 +144,7 @@ pub fn run_dir_scan(req: &ScanRequest, control: &Control, progress: &Progress, p
     let mut resumed = None;
     if let Some(prev) = catalog.resumable_scan(ids.filesystem_id)? {
         let path = staging_path(prev);
-        if req.resume == ResumeMode::Auto && path.exists() {
+        if resume == ResumeMode::Auto && path.exists() {
             match Staging::open(&path) {
                 Ok(st) => resumed = Some((prev, st)),
                 Err(_) => {
@@ -138,12 +171,12 @@ pub fn run_dir_scan(req: &ScanRequest, control: &Control, progress: &Progress, p
                 host,
                 host_tz: host::time_zone(),
                 mount_point: root_str.clone(),
-                threads: req.walk.threads,
+                threads: walk_cfg.threads,
                 options_json: Some(format!(
                     "{{\"one_file_system\":{},\"record_atime\":{},\"skip_dirs\":{}}}",
-                    req.walk.one_file_system,
-                    req.walk.record_atime,
-                    json_str_array(&req.walk.skip_dir_names)
+                    walk_cfg.one_file_system,
+                    walk_cfg.record_atime,
+                    json_str_array(&walk_cfg.skip_dir_names)
                 )),
             })?;
             (id, Staging::create(&staging_path(id), id, &root_meta)?, None)
@@ -161,11 +194,11 @@ pub fn run_dir_scan(req: &ScanRequest, control: &Control, progress: &Progress, p
     let writer = std::thread::Builder::new()
         .name("staging-writer".into())
         .spawn(move || run_writer(staging, rx, hardlinks))?;
-    let outcome = walk(&root, root_meta.dev, jobs, next_id, &req.walk, lister.as_ref(), control, progress, &tx);
+    let outcome = walk(root, root_meta.dev, jobs, next_id, walk_cfg, lister.as_ref(), control, progress, &tx);
     drop(tx);
     let mut staging = writer.join().map_err(|_| anyhow::anyhow!("staging writer panicked"))??;
     let walk_ms = walk_start.elapsed().as_millis() as u64;
-    catalog.add_scan_active_ms(scan_id, walk_ms, req.walk.threads)?;
+    catalog.add_scan_active_ms(scan_id, walk_ms, walk_cfg.threads)?;
 
     let mut result = ScanOutcome {
         status: ScanStatus::Interrupted,
@@ -196,7 +229,7 @@ pub fn run_dir_scan(req: &ScanRequest, control: &Control, progress: &Progress, p
 
     phase.set(Phase::Merging);
     let merge_start = Instant::now();
-    let stats = merge(&mut catalog, &staging_file, scan_id, ids.filesystem_id, &totals)?;
+    let stats = merge(catalog, &staging_file, scan_id, ids.filesystem_id, &totals)?;
     result.merge_ms = merge_start.elapsed().as_millis() as u64;
     remove_db_files(&staging_file);
 

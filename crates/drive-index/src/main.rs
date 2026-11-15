@@ -2,20 +2,22 @@
 //! default command; until then running without a subcommand prints help.
 
 mod output;
+mod scan_cmd;
+mod term;
+mod watch;
 
-use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 use di_core::Catalog;
 use di_core::search::{SearchError, SearchRequest, SortKey, search, summarize};
-use di_scan::{Phase, PhaseCell, ResumeMode, ScanRequest, ScanStatus, run_dir_scan};
+use di_scan::device::{DeviceScanRequest, IdentityChoice};
+use di_scan::{ResumeMode, ScanRequest};
 use di_walk::{Control, Progress, WalkConfig};
 
 #[derive(Parser)]
@@ -31,9 +33,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Scan a directory or mounted volume into the catalog (resumes an interrupted scan)
+    /// Scan a drive (/dev/disk7, disk7, /dev/sdb) or a directory into the catalog.
+    /// Drives are mounted read-only, scanned, then unmounted and ejected.
+    /// An interrupted scan resumes when run again.
     Scan {
-        dir: PathBuf,
+        /// Device or directory
+        target: String,
         /// Label for the drive (kept for later scans)
         #[arg(long)]
         label: Option<String>,
@@ -43,13 +48,43 @@ enum Command {
         /// Discard an interrupted scan instead of resuming it
         #[arg(long)]
         restart: bool,
-        /// Descend into other filesystems mounted below DIR
+        /// Directories: descend into other filesystems mounted below DIR
         #[arg(long)]
         cross_mounts: bool,
         /// Also record access times
         #[arg(long)]
         atime: bool,
         /// Don't show the progress line
+        #[arg(long, short = 'q')]
+        quiet: bool,
+        /// Drives: what to do afterwards
+        #[arg(long, value_enum, default_value_t = AfterArg::Eject)]
+        after: AfterArg,
+        /// Drives: treat as a new drive even if it matches a known one
+        #[arg(long, conflicts_with = "same_as")]
+        new_drive: bool,
+        /// Drives: treat as this known drive (D3)
+        #[arg(long, value_name = "DRIVE")]
+        same_as: Option<String>,
+        /// Drives: allow internal, non-removable disks (never the system disk)
+        #[arg(long)]
+        allow_internal: bool,
+    },
+    /// Watch for drives being connected; scan them and eject when done
+    Watch {
+        /// Also scan drives the catalog has never seen (otherwise they are only reported)
+        #[arg(long)]
+        scan_new: bool,
+        /// Rescan known drives whose last scan is older than this (e.g. 30d, 12h, 0)
+        #[arg(long, default_value = "30d")]
+        rescan_after: String,
+        /// Treat attached disk images like drives (for testing)
+        #[arg(long)]
+        include_images: bool,
+        #[arg(long, value_enum, default_value_t = AfterArg::Eject)]
+        after: AfterArg,
+        #[arg(long, short = 'j')]
+        threads: Option<usize>,
         #[arg(long, short = 'q')]
         quiet: bool,
     },
@@ -79,6 +114,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show drives, partitions and filesystems as the OS reports them (read-only)
+    Info {
+        /// Disk or volume (disk4, /dev/sdb1); omit to list all external drives
+        dev: Option<String>,
+        /// Include internal and system disks in the listing
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Walk a directory without touching any database (walker benchmark)
     #[command(hide = true)]
     BenchWalk {
@@ -105,6 +150,26 @@ enum SortArg {
     Name,
     Size,
     Mtime,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AfterArg {
+    /// Unmount and eject (power off)
+    Eject,
+    /// Unmount only
+    Unmount,
+    /// Leave mounted (read-only)
+    Keep,
+}
+
+impl AfterArg {
+    pub fn to_after(self) -> di_scan::device::After {
+        match self {
+            AfterArg::Eject => di_scan::device::After::Eject,
+            AfterArg::Unmount => di_scan::device::After::Unmount,
+            AfterArg::Keep => di_scan::device::After::KeepMounted,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -142,24 +207,56 @@ fn run(cli: Cli) -> Result<ExitCode> {
     };
     let db = catalog_path(cli.db)?;
     match command {
-        Command::Scan { dir, label, threads, restart, cross_mounts, atime, quiet } => {
-            let mut walk = WalkConfig::default();
-            if let Some(t) = threads {
-                if t == 0 {
-                    bail!("--threads must be at least 1");
-                }
-                walk.threads = t;
-            }
+        Command::Scan {
+            target,
+            label,
+            threads,
+            restart,
+            cross_mounts,
+            atime,
+            quiet,
+            after,
+            new_drive,
+            same_as,
+            allow_internal,
+        } => {
+            let mut walk = walk_config(threads)?;
             walk.one_file_system = !cross_mounts;
             walk.record_atime = atime;
-            let req = ScanRequest {
+            let resume = if restart { ResumeMode::Restart } else { ResumeMode::Auto };
+            if scan_cmd::is_device(&target) {
+                let identity = match (new_drive, same_as) {
+                    (true, _) => IdentityChoice::New,
+                    (_, Some(d)) => IdentityChoice::SameAs(parse_drive_id(&d)?),
+                    _ => IdentityChoice::Auto,
+                };
+                let req = DeviceScanRequest {
+                    catalog_path: db,
+                    dev: target,
+                    label,
+                    walk,
+                    resume,
+                    after: after.to_after(),
+                    identity,
+                    allow_internal,
+                };
+                scan_cmd::scan_device(&req, quiet)
+            } else {
+                let req = ScanRequest { catalog_path: db, dir: PathBuf::from(target), label, walk, resume };
+                scan_cmd::scan_dir(&req, quiet)
+            }
+        }
+        Command::Watch { scan_new, rescan_after, include_images, after, threads, quiet } => {
+            let opts = watch::WatchOptions {
                 catalog_path: db,
-                dir,
-                label,
-                walk,
-                resume: if restart { ResumeMode::Restart } else { ResumeMode::Auto },
+                scan_new,
+                rescan_after_secs: watch::parse_age(&rescan_after)?,
+                include_images,
+                after: after.to_after(),
+                walk: walk_config(threads)?,
+                quiet,
             };
-            cmd_scan(&req, quiet)
+            watch::run(&opts)
         }
         Command::Search { query, limit, sort, desc, count, json } => {
             let query = query.join(" ");
@@ -175,6 +272,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Info { dev, all, json } => cmd_info(dev.as_deref(), all, json),
         Command::BenchWalk { dir, threads, generic } => cmd_bench_walk(&dir, threads, generic),
         Command::Label { drive, label, clear } => {
             let id = parse_drive_id(&drive)?;
@@ -192,6 +290,33 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+fn cmd_info(dev: Option<&str>, all: bool, json: bool) -> Result<ExitCode> {
+    let probes = match dev {
+        Some(d) => vec![di_platform::probe(d)?],
+        None => {
+            let mut v = Vec::new();
+            for id in di_platform::list_drives()? {
+                match di_platform::probe(&id) {
+                    Ok(p) if all || p.is_external() => v.push(p),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("warning: {id}: {e:#}"),
+                }
+            }
+            v
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&probes)?);
+    } else if probes.is_empty() {
+        println!("No external drives found (use --all to include internal disks).");
+    } else {
+        for p in &probes {
+            output::print_probe(p);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_bench_walk(dir: &std::path::Path, threads: Option<usize>, generic: bool) -> Result<ExitCode> {
@@ -225,82 +350,20 @@ fn cmd_bench_walk(dir: &std::path::Path, threads: Option<usize>, generic: bool) 
     Ok(ExitCode::SUCCESS)
 }
 
-fn parse_drive_id(s: &str) -> Result<i64> {
+pub fn parse_drive_id(s: &str) -> Result<i64> {
     let digits = s.strip_prefix(['D', 'd']).unwrap_or(s);
     digits.parse().with_context(|| format!("'{s}' is not a drive id like D3"))
 }
 
-fn cmd_scan(req: &ScanRequest, quiet: bool) -> Result<ExitCode> {
-    let control = Arc::new(Control::default());
-    let progress = Arc::new(Progress::default());
-    let phase = Arc::new(PhaseCell::default());
-
-    let interrupts = Arc::new(AtomicUsize::new(0));
-    {
-        let (control, interrupts) = (control.clone(), interrupts.clone());
-        ctrlc::set_handler(move || {
-            if interrupts.fetch_add(1, Ordering::SeqCst) == 0 {
-                control.cancel();
-            } else {
-                // Second Ctrl-C: give up immediately. The staging DB stays consistent.
-                std::process::exit(130);
-            }
-        })
-        .context("installing Ctrl-C handler")?;
-    }
-
-    let show = !quiet && std::io::stderr().is_terminal();
-    let start = Instant::now();
-    let reporter = show.then(|| {
-        let (progress, phase, control) = (progress.clone(), phase.clone(), control.clone());
-        std::thread::spawn(move || output::progress_loop(&progress, &phase, &control, start))
-    });
-
-    let result = run_dir_scan(req, &control, &progress, &phase);
-    phase.set(Phase::Done);
-    if let Some(r) = reporter {
-        let _ = r.join();
-    }
-    let out = result?;
-    let t = &out.totals;
-    match out.status {
-        ScanStatus::Complete => {
-            let files = progress.files.load(Ordering::Relaxed);
-            let secs = out.walk_ms as f64 / 1000.0;
-            let rate = if secs > 0.0 { files as f64 / secs } else { 0.0 };
-            if let Some(done) = out.resumed_dirs {
-                println!(
-                    "Resumed scan #{} ({} directories were already done).",
-                    out.scan_id,
-                    di_model::units::format_count(done)
-                );
-            }
-            println!(
-                "Scanned D{} — {} files, {} dirs, {} in {} ({}/s, {}, {} threads); merged in {}.",
-                out.drive_id,
-                di_model::units::format_count(t.files),
-                di_model::units::format_count(t.dirs),
-                di_model::units::format_size(t.bytes),
-                output::format_duration(Duration::from_millis(out.walk_ms)),
-                di_model::units::format_count(rate as u64),
-                out.method,
-                req.walk.threads,
-                output::format_duration(Duration::from_millis(out.merge_ms)),
-            );
-            if t.errors > 0 {
-                println!("{} entries could not be read (permissions or I/O errors).", t.errors);
-            }
-            Ok(ExitCode::SUCCESS)
+fn walk_config(threads: Option<usize>) -> Result<WalkConfig> {
+    let mut walk = WalkConfig::default();
+    if let Some(t) = threads {
+        if t == 0 {
+            bail!("--threads must be at least 1");
         }
-        ScanStatus::Interrupted => {
-            println!(
-                "Scan #{} interrupted after {} directories. Run the same command again to resume, or add --restart.",
-                out.scan_id,
-                di_model::units::format_count(progress.dirs.load(Ordering::Relaxed))
-            );
-            Ok(ExitCode::from(130))
-        }
+        walk.threads = t;
     }
+    Ok(walk)
 }
 
 fn cmd_search(cat: &Catalog, query: &str, limit: usize, sort: SortArg, desc: bool, count: bool, json: bool) -> Result<ExitCode> {

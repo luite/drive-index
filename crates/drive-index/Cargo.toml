@@ -12,6 +12,7 @@ crossbeam-channel = "0.5.17"
 ctrlc = "3.5.2"
 di-core = { version = "0.1.0", path = "../di-core" }
 di-model = { version = "0.1.0", path = "../di-model" }
+di-platform = { version = "0.1.0", path = "../di-platform" }
 di-scan = { version = "0.1.0", path = "../di-scan" }
 di-walk = { version = "0.1.0", path = "../di-walk" }
 directories = "6.0.0"

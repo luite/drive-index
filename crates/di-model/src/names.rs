@@ -42,6 +42,10 @@ pub fn normalize(raw: &[u8]) -> StoredName {
 /// (`.bashrc`), names ending in a dot, and implausible "extensions" (too long or
 /// containing spaces), which are usually just dots inside a name.
 pub fn extension(name: &str) -> Option<String> {
+    // AppleDouble companions (`._IMG_0001.CR2`) hold macOS metadata, not file content.
+    if name.starts_with("._") {
+        return None;
+    }
     let dot = name.rfind('.')?;
     if dot == 0 {
         return None;
@@ -105,6 +109,7 @@ mod tests {
         assert_eq!(extension("trailing."), None);
         assert_eq!(extension("v1.0 final draft"), None);
         assert_eq!(extension(".config.json").as_deref(), Some("json"));
+        assert_eq!(extension("._IMG_0001.CR2"), None);
     }
 
     #[test]

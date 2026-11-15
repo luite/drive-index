@@ -1,8 +1,6 @@
 //! Plain-text and JSON output for the CLI.
 
-use std::io::Write;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use jiff::Timestamp;
@@ -11,8 +9,6 @@ use jiff::tz::TimeZone;
 use di_core::catalog::{DriveSummary, FsSummary, ScanSummary};
 use di_core::search::{Hit, Summary};
 use di_model::units::{format_count, format_size};
-use di_scan::{Phase, PhaseCell};
-use di_walk::{Control, Progress};
 
 pub fn format_duration(d: Duration) -> String {
     let s = d.as_secs_f64();
@@ -37,21 +33,7 @@ fn local_secs(s: Option<i64>) -> String {
     local_ns(s.map(|s| s.saturating_mul(1_000_000_000)))
 }
 
-fn terminal_width() -> usize {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let ok = unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
-    if ok && ws.ws_col > 0 { ws.ws_col as usize } else { 100 }
-}
 
-/// Keep the end of a path, which is the informative part: `…/2014-07 Iceland/RAW`.
-fn tail(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
-        return s.to_string();
-    }
-    let keep: String = s.chars().skip(n - max.saturating_sub(1)).collect();
-    format!("…{keep}")
-}
 
 fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -63,50 +45,6 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
-/// Redraw a one-line progress display on stderr until the scan is done.
-pub fn progress_loop(p: &Progress, phase: &PhaseCell, control: &Control, start: Instant) {
-    let mut err = std::io::stderr();
-    let mut last = (Instant::now(), 0u64);
-    let mut rate = 0.0f64;
-    loop {
-        let ph = phase.get();
-        if ph == Phase::Done {
-            let _ = write!(err, "\r\x1b[2K");
-            let _ = err.flush();
-            return;
-        }
-        let files = p.files.load(Ordering::Relaxed);
-        let now = Instant::now();
-        let dt = now.duration_since(last.0).as_secs_f64();
-        if dt >= 0.5 {
-            let inst = (files - last.1) as f64 / dt;
-            rate = if rate == 0.0 { inst } else { rate * 0.6 + inst * 0.4 };
-            last = (now, files);
-        }
-        let label = match ph {
-            Phase::Preparing => "preparing",
-            Phase::Walking if control.is_cancelled() => "stopping",
-            Phase::Walking => "scanning",
-            Phase::Aggregating => "totals",
-            Phase::Merging => "merging",
-            Phase::Done => "done",
-        };
-        let head = format!(
-            "{label:<9} {} files  {} dirs  {}  {}/s  {}  ",
-            format_count(files),
-            format_count(p.dirs.load(Ordering::Relaxed)),
-            format_size(p.bytes.load(Ordering::Relaxed)),
-            format_count(rate as u64),
-            format_duration(start.elapsed()),
-        );
-        let width = terminal_width();
-        let room = width.saturating_sub(head.chars().count() + 1);
-        let path = if ph == Phase::Walking && room > 10 { tail(&p.current_path(), room) } else { String::new() };
-        let _ = write!(err, "\r\x1b[2K{head}{path}");
-        let _ = err.flush();
-        std::thread::sleep(Duration::from_millis(150));
-    }
-}
 
 pub fn print_hits(hits: &[Hit]) {
     if hits.is_empty() {
@@ -221,4 +159,81 @@ pub fn print_scans(list: &[ScanSummary], json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub fn print_probe(p: &di_platform::DriveProbe) {
+    let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
+    let mut flags = Vec::new();
+    if p.system_disk {
+        flags.push("system");
+    }
+    flags.push(if p.internal { "internal" } else { "external" });
+    if p.removable {
+        flags.push("removable");
+    }
+    println!(
+        "{}  {}  {}  {}  {}  [{}]",
+        p.dev_path,
+        p.model.as_deref().unwrap_or("?"),
+        format_size(p.capacity_bytes),
+        p.bus.as_str(),
+        p.ptable_type.as_deref().unwrap_or("?"),
+        flags.join(", ")
+    );
+    println!(
+        "  vendor {}  serial {}  rev {}  medium {}  block {}",
+        opt(&p.vendor),
+        opt(&p.serial),
+        opt(&p.revision),
+        p.medium.as_str(),
+        p.logical_block_size.map(|b| format!("{b} B")).unwrap_or_else(|| "-".into())
+    );
+    if let Some(u) = &p.usb {
+        println!(
+            "  usb {:04x}:{:04x}  {} {}  serial {}  {}",
+            u.vendor_id.unwrap_or(0),
+            u.product_id.unwrap_or(0),
+            opt(&u.manufacturer),
+            opt(&u.product),
+            opt(&u.serial),
+            u.speed_mbps.map(|s| format!("{s} Mb/s")).unwrap_or_default()
+        );
+    }
+    if !p.partitions.is_empty() {
+        println!("  {:<3} {:<10} {:>14} {:>10}  {:<24} PARTITION UUID", "#", "DEV", "START", "SIZE", "TYPE");
+        for part in &p.partitions {
+            println!(
+                "  {:<3} {:<10} {:>14} {:>10}  {:<24} {}",
+                part.number,
+                part.dev,
+                format_count(part.start_bytes),
+                format_size(part.size_bytes),
+                clip(part.type_name.as_deref().or(part.type_id.as_deref()).unwrap_or("-"), 24),
+                part.part_uuid.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    for v in &p.volumes {
+        let state = match (&v.mount_point, v.mounted_writable) {
+            (Some(mp), Some(true)) => format!("mounted rw at {}", mp.display()),
+            (Some(mp), _) => format!("mounted ro at {}", mp.display()),
+            (None, _) => "not mounted".into(),
+        };
+        println!(
+            "  fs {:<9} {:<8} {:<16} part {}  uuid {}  {}{}",
+            v.dev,
+            v.fs_type,
+            clip(v.label.as_deref().unwrap_or("-"), 16),
+            v.partition_number.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+            v.fs_uuid.as_deref().unwrap_or("-"),
+            state,
+            v.unscannable_reason.as_ref().map(|r| format!("  (unscannable: {r})")).unwrap_or_default()
+        );
+    }
+    let ids = di_platform::identity::identifiers(p);
+    if !ids.is_empty() {
+        let list: Vec<String> = ids.iter().map(|i| format!("{}={}", i.kind, i.value)).collect();
+        println!("  identifiers: {}", list.join("  "));
+    }
+    println!();
 }
