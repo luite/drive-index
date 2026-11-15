@@ -4,6 +4,7 @@ description = "Setuid helper that lets drive-index read SMART health on Linux wi
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]

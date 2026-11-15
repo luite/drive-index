@@ -50,10 +50,12 @@ Runs on macOS and Linux. Written in Rust.
 You need Rust 1.88 or newer ([rustup](https://rustup.rs)).
 
 ```sh
-git clone <this repository> && cd drive-index
+git clone https://github.com/luite/drive-index.git && cd drive-index
 cargo install --locked --path crates/drive-index
 drive-index doctor
 ```
+
+Or without a checkout: `cargo install --locked --git https://github.com/luite/drive-index.git drive-index`.
 
 `doctor` checks the optional tools and permissions, and prints the command that installs
 what is missing:
@@ -231,4 +233,13 @@ The workspace has these crates:
 
 ## License
 
-MIT OR Apache-2.0.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion
+in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above,
+without any additional terms or conditions.
