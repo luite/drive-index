@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Catalog databases created during development/tests
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+/staging/
+
+# Benchmark output
+/bench/out/
+
+# OS / editor noise
+.DS_Store
+.idea/
+*.swp
