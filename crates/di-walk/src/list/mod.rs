@@ -70,7 +70,11 @@ pub trait Lister: Send + Sync {
 
 /// The fastest lister for this platform, with automatic per-directory fallback to
 /// [`GenericLister`] where the fast path is unsupported.
+/// `DRIVE_INDEX_LISTER=generic` forces the portable lister (for benchmarking).
 pub fn best_lister() -> Box<dyn Lister> {
+    if std::env::var("DRIVE_INDEX_LISTER").is_ok_and(|v| v == "generic") {
+        return Box::new(GenericLister);
+    }
     #[cfg(target_os = "macos")]
     {
         Box::new(macos::BulkLister::new())

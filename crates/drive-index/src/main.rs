@@ -79,6 +79,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Walk a directory without touching any database (walker benchmark)
+    #[command(hide = true)]
+    BenchWalk {
+        dir: PathBuf,
+        #[arg(long, short = 'j')]
+        threads: Option<usize>,
+        /// Use the portable lister instead of the platform fast path
+        #[arg(long)]
+        generic: bool,
+    },
     /// Set a drive's label (D3 or 3)
     Label {
         drive: String,
@@ -165,6 +175,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::BenchWalk { dir, threads, generic } => cmd_bench_walk(&dir, threads, generic),
         Command::Label { drive, label, clear } => {
             let id = parse_drive_id(&drive)?;
             if label.is_none() && !clear {
@@ -181,6 +192,37 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+fn cmd_bench_walk(dir: &std::path::Path, threads: Option<usize>, generic: bool) -> Result<ExitCode> {
+    use di_walk::{DirJob, Lister, best_lister, list::GenericLister, stat_path, walk};
+    let root = dir.canonicalize()?;
+    let (_, meta) = stat_path(&root)?;
+    let mut cfg = WalkConfig::default();
+    if let Some(t) = threads {
+        cfg.threads = t.max(1);
+    }
+    let lister: Box<dyn Lister> = if generic { Box::new(GenericLister) } else { best_lister() };
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let sink = std::thread::spawn(move || rx.iter().map(|b: di_walk::DirBatch| b.files.len() as u64).sum::<u64>());
+    let job = DirJob { id: 1, os_path: vec![], path: "/".into(), depth: 0, in_trash: false };
+    let progress = Progress::default();
+    let start = Instant::now();
+    walk(&root, meta.dev, vec![job], 2, &cfg, lister.as_ref(), &Control::default(), &progress, &tx);
+    drop(tx);
+    let files = sink.join().map_err(|_| anyhow::anyhow!("sink panicked"))?;
+    let secs = start.elapsed().as_secs_f64();
+    let dirs = progress.dirs.load(Ordering::Relaxed);
+    println!(
+        "{}: {} files, {} dirs in {:.0} ms with {} threads ({}/s entries)",
+        lister.method(),
+        di_model::units::format_count(files),
+        di_model::units::format_count(dirs),
+        secs * 1000.0,
+        cfg.threads,
+        di_model::units::format_count(((files + dirs) as f64 / secs) as u64)
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn parse_drive_id(s: &str) -> Result<i64> {

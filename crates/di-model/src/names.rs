@@ -14,6 +14,12 @@ pub struct StoredName {
 /// Normalize raw on-disk name bytes for storage (PLAN.md §4.6): lossy UTF-8, then NFC.
 /// `raw` is kept only when the stored form differs from the original bytes.
 pub fn normalize(raw: &[u8]) -> StoredName {
+    // Fast path for the common case: ASCII is valid UTF-8 and already NFC.
+    if raw.is_ascii() {
+        // SAFETY: ASCII bytes are valid UTF-8.
+        let name = unsafe { std::str::from_utf8_unchecked(raw) }.to_owned();
+        return StoredName { name, raw: None };
+    }
     match std::str::from_utf8(raw) {
         Ok(s) => {
             if matches!(is_nfc_quick(s.chars()), IsNormalized::Yes) {

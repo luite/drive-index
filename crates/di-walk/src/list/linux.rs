@@ -42,6 +42,60 @@ impl Lister for StatxLister {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::fs;
+
+    /// The statx path must agree with lstat (via std) on every field we store.
+    #[test]
+    fn statx_matches_lstat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("a.txt"), b"hello world").unwrap();
+        fs::write(root.join("caf\u{0065}\u{0301}.jpg"), vec![7u8; 70_000]).unwrap();
+        std::os::unix::fs::symlink("a.txt", root.join("ln")).unwrap();
+        fs::hard_link(root.join("a.txt"), root.join("a2.txt")).unwrap();
+        for i in 0..2000 {
+            fs::write(root.join(format!("f{i:05}.dat")), vec![0u8; i % 97]).unwrap();
+        }
+
+        let mut out = Vec::new();
+        let mut buf = Vec::new();
+        list_statx(root, &mut out, &mut buf).expect("statx listing works");
+        assert_eq!(out.len(), 2005);
+        let inodes: Vec<u64> = out.iter().map(|e| e.meta.inode.unwrap()).collect();
+        assert!(inodes.windows(2).all(|w| w[0] <= w[1]), "entries are in inode order");
+
+        let by_name: HashMap<Vec<u8>, &Entry> = out.iter().map(|e| (e.name.clone(), e)).collect();
+        for de in fs::read_dir(root).unwrap() {
+            let de = de.unwrap();
+            let name = de.file_name().as_bytes().to_vec();
+            let e = by_name.get(&name).unwrap_or_else(|| panic!("missing {:?}", de.file_name()));
+            let (kind, m) = crate::stat_path(&de.path()).unwrap();
+            assert_eq!(e.kind, kind, "{:?}", de.file_name());
+            assert_eq!(e.meta.inode, m.inode);
+            assert_eq!(e.meta.dev, m.dev, "device numbers must match std's encoding");
+            assert_eq!(e.meta.mtime_ns, m.mtime_ns);
+            assert_eq!(e.meta.ctime_ns, m.ctime_ns);
+            assert_eq!(e.meta.mode, m.mode);
+            assert_eq!((e.meta.uid, e.meta.gid), (m.uid, m.gid));
+            assert_eq!(e.meta.nlink, m.nlink);
+            assert_eq!(e.meta.size, m.size, "{:?}", de.file_name());
+            assert_eq!(e.meta.alloc, m.alloc, "{:?}", de.file_name());
+            if m.btime_ns.is_some() {
+                assert_eq!(e.meta.btime_ns, m.btime_ns);
+            }
+            assert!(e.error.is_none());
+            assert!(!e.meta.mount_point);
+        }
+        assert_eq!(by_name[&b"ln".to_vec()].link_target.as_deref(), Some(&b"a.txt"[..]));
+        assert_eq!(by_name[&b"a2.txt".to_vec()].meta.nlink, Some(2));
+    }
+}
+
 fn list_statx(dir: &Path, out: &mut Vec<Entry>, buf: &mut Vec<u8>) -> io::Result<()> {
     out.clear();
     let fd = rustix::fs::openat(

@@ -299,14 +299,13 @@ fn list_dir(
 
     for entry in entries.drain(..) {
         let stored = names::normalize(&entry.name);
-        let child_path = if job.path == "/" {
-            format!("/{}", stored.name)
-        } else {
-            format!("{}/{}", job.path, stored.name)
+        // Display paths are only needed for directories and error rows.
+        let child_path = || {
+            if job.path == "/" { format!("/{}", stored.name) } else { format!("{}/{}", job.path, stored.name) }
         };
         if let Some((op, errno, message)) = &entry.error {
             batch.errors.push(ErrorRow {
-                path: child_path.clone(),
+                path: child_path(),
                 op,
                 errno: *errno,
                 message: message.clone(),
@@ -323,6 +322,7 @@ fn list_dir(
 
         match entry.kind {
             EntryKind::Dir => {
+                let child_path = child_path();
                 let id = ids.fetch_add(1, Ordering::Relaxed);
                 let os_path = if job.os_path.is_empty() {
                     entry.name.clone()
