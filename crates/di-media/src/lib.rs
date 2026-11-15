@@ -314,6 +314,32 @@ impl Extractor {
     }
 }
 
+/// BLAKE3 of the whole file, streamed in 1 MiB chunks. Returns None if `stop()`
+/// becomes true midway. `on_bytes` is told about progress.
+pub fn full_hash(path: &Path, stop: &dyn Fn() -> bool, on_bytes: &dyn Fn(u64)) -> std::io::Result<Option<[u8; 32]>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    #[cfg(target_os = "macos")]
+    unsafe {
+        use std::os::fd::AsRawFd;
+        libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1);
+    }
+    let mut h = blake3::Hasher::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        if stop() {
+            return Ok(None);
+        }
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+        on_bytes(n as u64);
+    }
+    Ok(Some(*h.finalize().as_bytes()))
+}
+
 /// The quick hash from the reader's prefetched buffers.
 pub fn quick_hash(r: &HeadTailReader) -> [u8; 16] {
     let size = r.size();

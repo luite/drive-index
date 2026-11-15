@@ -12,6 +12,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 pub mod identity;
+pub mod smart;
 pub mod util;
 
 #[cfg(target_os = "linux")]

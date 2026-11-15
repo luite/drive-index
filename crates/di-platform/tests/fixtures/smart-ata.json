@@ -1,0 +1,79 @@
+{
+ "smartctl": {
+  "exit_status": 0
+ },
+ "device": {
+  "name": "/dev/sdb",
+  "type": "sat",
+  "protocol": "ATA"
+ },
+ "model_name": "WDC WD20SPZX-22UA7T0",
+ "serial_number": "WD-TEST1234",
+ "firmware_version": "01.01A01",
+ "wwn": {
+  "naa": 5,
+  "oui": 5358,
+  "id": 12345678901
+ },
+ "rotation_rate": 5400,
+ "form_factor": {
+  "name": "2.5 inches"
+ },
+ "smart_status": {
+  "passed": true
+ },
+ "temperature": {
+  "current": 31
+ },
+ "power_on_time": {
+  "hours": 12431
+ },
+ "power_cycle_count": 870,
+ "ata_smart_attributes": {
+  "table": [
+   {
+    "id": 5,
+    "name": "Reallocated_Sector_Ct",
+    "raw": {
+     "value": 0
+    }
+   },
+   {
+    "id": 9,
+    "name": "Power_On_Hours",
+    "raw": {
+     "value": 12431
+    }
+   },
+   {
+    "id": 197,
+    "name": "Current_Pending_Sector",
+    "raw": {
+     "value": 8
+    }
+   },
+   {
+    "id": 198,
+    "name": "Offline_Uncorrectable",
+    "raw": {
+     "value": 0
+    }
+   },
+   {
+    "id": 199,
+    "name": "UDMA_CRC_Error_Count",
+    "raw": {
+     "value": 3
+    }
+   },
+   {
+    "id": 241,
+    "name": "Total_LBAs_Written",
+    "raw": {
+     "value": 1000000
+    }
+   }
+  ]
+ },
+ "logical_block_size": 512
+}

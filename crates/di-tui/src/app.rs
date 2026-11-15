@@ -18,7 +18,9 @@ use di_platform::DriveProbe;
 use di_scan::controller::{Command, Controller, Event, Level, Outcome, Question};
 use di_scan::device::{IdentityChoice, report_lines};
 
+use crate::assist::{self, Candidate, Vocab};
 use crate::input::LineEdit;
+use crate::screens::{CollectionsState, DupesState};
 use crate::search_worker::{self, SearchWorker};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +95,8 @@ pub enum Modal {
     Ambiguous { disk: String, desc: String, candidates: Vec<(i64, String)>, sel: usize },
     ConfirmQuit,
     File(Box<FileDetail>),
+    /// The search filter reference; `sel` indexes `di_core::filters::FILTERS`.
+    Filters { sel: usize },
 }
 
 /// Where things were drawn in the last frame, for mapping mouse clicks.
@@ -104,6 +108,10 @@ pub struct Hits {
     pub list: Option<ListHit>,
     pub search_input: Option<Rect>,
     pub modal: Option<Rect>,
+    /// Example queries on the search cheat sheet: (row, query).
+    pub examples: Vec<(u16, &'static str)>,
+    /// Filter reference rows: (row, index into FILTERS).
+    pub filter_rows: Vec<(u16, usize)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +120,9 @@ pub enum ListKind {
     Results,
     BrowseFs,
     BrowseEntries,
+    DupeGroups,
+    DupeMembers,
+    CoverageDrives,
 }
 
 /// A table's data rows on screen.
@@ -129,8 +140,18 @@ pub struct LogLine {
     pub text: String,
 }
 
+/// Tab cycling through several completions.
+pub struct Cycle {
+    pub start: usize,
+    pub items: Vec<Candidate>,
+    pub idx: usize,
+    /// The query right after the last insertion; any other edit ends the cycle.
+    pub after: String,
+}
+
 pub struct SearchState {
     pub input: LineEdit,
+    pub cycle: Option<Cycle>,
     pub focused: bool,
     pub hits: Vec<Hit>,
     pub summary: Option<Summary>,
@@ -185,7 +206,12 @@ pub struct App {
 
     pub search: SearchState,
     worker: SearchWorker,
+    /// Catalog values for completing filter values.
+    pub vocab: Vocab,
+    vocab_rx: Option<std::sync::mpsc::Receiver<Vocab>>,
     pub browse: BrowseState,
+    pub dupes: DupesState,
+    pub collections: CollectionsState,
     pub log: VecDeque<LogLine>,
     pub setup: SetupState,
     pub modal: Option<Modal>,
@@ -216,11 +242,12 @@ impl App {
             rate: Rate::default(),
             search: SearchState {
                 input: LineEdit::default(),
+                cycle: None,
                 focused: false,
                 hits: Vec::new(),
                 summary: None,
                 error: None,
-                message: Some("Type a query, e.g.  ext:cr2,crw date:2014 size:>10M".into()),
+                message: None,
                 sel: 0,
                 sort: SortKey::Path,
                 descending: false,
@@ -230,6 +257,8 @@ impl App {
                 running: false,
             },
             worker,
+            vocab: Vocab::default(),
+            vocab_rx: None,
             browse: BrowseState {
                 filesystems: Vec::new(),
                 fs_sel: 0,
@@ -238,6 +267,8 @@ impl App {
                 sel: 0,
                 sort: BrowseSort::Size,
             },
+            dupes: DupesState::default(),
+            collections: CollectionsState::default(),
             log: VecDeque::new(),
             setup: SetupState { report: None, running: false, rx: None },
             modal: None,
@@ -250,10 +281,23 @@ impl App {
         app.load_log();
         app.refresh();
         app.run_doctor();
+        app.load_vocab();
         app
     }
 
-    fn catalog(&self) -> Option<Catalog> {
+    /// Reload completion values in the background (after start and after scans).
+    fn load_vocab(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = self.catalog_path.clone();
+        std::thread::spawn(move || {
+            if let Ok(c) = Catalog::open_readonly(&path) {
+                let _ = tx.send(Vocab::load(c.conn()));
+            }
+        });
+        self.vocab_rx = Some(rx);
+    }
+
+    pub(crate) fn catalog(&self) -> Option<Catalog> {
         Catalog::open_readonly(&self.catalog_path).ok()
     }
 
@@ -305,6 +349,11 @@ impl App {
         }
         while let Ok(resp) = self.worker.results.try_recv() {
             self.on_search_result(resp);
+        }
+        self.tick_screens();
+        if let Some(v) = self.vocab_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.vocab = v;
+            self.vocab_rx = None;
         }
         if let Some(rx) = &self.setup.rx {
             if let Ok(r) = rx.try_recv() {
@@ -434,6 +483,8 @@ impl App {
                 if let Some(c) = self.connected.get_mut(&disk) {
                     c.status = status;
                 }
+                self.load_vocab();
+                self.invalidate_screens();
             }
         }
     }
@@ -521,6 +572,68 @@ impl App {
         });
     }
 
+    fn query_edited(&mut self) {
+        self.search.dirty_at = Some(Instant::now());
+        self.search.sel = 0;
+        self.search.limit = 500;
+    }
+
+    /// Tab completion at the cursor. Several candidates: the first Tab inserts the
+    /// first, repeated Tabs cycle. Returns false if there was nothing to complete.
+    pub fn complete(&mut self, forward: bool) -> bool {
+        let text = self.search.input.text().to_string();
+        if let Some(c) = self.search.cycle.as_mut().filter(|c| c.after == text) {
+            let n = c.items.len();
+            let old = c.items[c.idx].insert.chars().count();
+            c.idx = if forward { (c.idx + 1) % n } else { (c.idx + n - 1) % n };
+            self.search.input.replace(c.start, c.start + old, &c.items[c.idx].insert);
+            c.after = self.search.input.text().to_string();
+            self.query_edited();
+            return true;
+        }
+        self.search.cycle = None;
+        let ctx = assist::context(&text, self.search.input.cursor());
+        let items = assist::candidates(&ctx, &self.vocab);
+        let Some((start, end)) = assist::replace_range(&ctx).filter(|_| !items.is_empty()) else { return false };
+        let idx = if forward { 0 } else { items.len() - 1 };
+        self.search.input.replace(start, end, &items[idx].insert);
+        if items.len() > 1 {
+            self.search.cycle = Some(Cycle { start, items, idx, after: self.search.input.text().to_string() });
+        }
+        self.query_edited();
+        true
+    }
+
+    /// The active completion cycle, if the query has not been edited since.
+    pub fn active_cycle(&self) -> Option<&Cycle> {
+        self.search.cycle.as_ref().filter(|c| c.after == self.search.input.text())
+    }
+
+    /// Insert `key:` from the filter reference and continue typing in the box.
+    fn insert_filter(&mut self, i: usize) {
+        let Some(doc) = di_core::filters::FILTERS.get(i) else { return };
+        let mut text = self.search.input.text().to_string();
+        if !doc.key.is_empty() {
+            if !text.is_empty() && !text.ends_with(' ') {
+                text.push(' ');
+            }
+            text.push_str(doc.key);
+            text.push(':');
+            self.search.input.set(&text);
+            self.query_edited();
+        }
+        self.screen = Screen::Search;
+        self.search.focused = true;
+    }
+
+    /// Run an example query from the cheat sheet.
+    pub fn use_example(&mut self, q: &str) {
+        self.search.input.set(q);
+        self.search.cycle = None;
+        self.query_edited();
+        self.search.focused = true;
+    }
+
     fn on_search_result(&mut self, resp: search_worker::Response) {
         if resp.generation != self.search.generation {
             return;
@@ -548,6 +661,23 @@ impl App {
         self.browse.dir = views::dir_info(cat.conn(), dir_id).ok().flatten();
         self.browse.entries = views::list_dir(cat.conn(), dir_id, self.browse.sort, 5000).unwrap_or_default();
         self.browse.sel = 0;
+    }
+
+    /// Open the file's directory on the Browse screen with the file selected.
+    pub(crate) fn browse_to_file(&mut self, file_id: i64) {
+        let Some(cat) = self.catalog() else { return };
+        let dir: Option<i64> = cat.conn().query_row("SELECT dir_id FROM files WHERE id = ?1", [file_id], |r| r.get(0)).ok();
+        let Some(dir) = dir else { return };
+        self.open_dir(dir);
+        if let Some(i) = self.browse.entries.iter().position(|e| !e.is_dir && e.id == file_id) {
+            self.browse.sel = i;
+        }
+        if let Some(fs) = self.browse.dir.as_ref().map(|d| d.filesystem_id) {
+            if let Some(i) = self.browse.filesystems.iter().position(|f| f.fs_id == fs) {
+                self.browse.fs_sel = i;
+            }
+        }
+        self.screen = Screen::Browse;
     }
 
     fn browse_up(&mut self) {
@@ -601,15 +731,28 @@ impl App {
             return;
         }
         // Text input on the Search screen swallows printable keys.
+        if key.code == KeyCode::F(1) {
+            self.modal = Some(Modal::Filters { sel: 0 });
+            return;
+        }
+        if self.screen == Screen::Dupes && self.dupes_editing_key(key) {
+            return;
+        }
         if self.screen == Screen::Search && self.search.focused {
             match key.code {
-                KeyCode::Esc => self.search.focused = false,
-                KeyCode::Enter | KeyCode::Down | KeyCode::Tab => self.search.focused = false,
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Down => self.search.focused = false,
+                // Tab completes; with nothing to complete it moves to the results.
+                KeyCode::Tab => {
+                    if !self.complete(true) {
+                        self.search.focused = false;
+                    }
+                }
+                KeyCode::BackTab => {
+                    self.complete(false);
+                }
                 _ => {
                     if self.search.input.handle(key) {
-                        self.search.dirty_at = Some(Instant::now());
-                        self.search.sel = 0;
-                        self.search.limit = 500;
+                        self.query_edited();
                     }
                 }
             }
@@ -641,8 +784,10 @@ impl App {
             Screen::Drives => self.drives_key(key),
             Screen::Search => self.search_key(key),
             Screen::Browse => self.browse_key(key),
+            Screen::Dupes => self.dupes_key(key),
+            Screen::Collections => self.collections_key(key),
             Screen::Setup => self.setup_key(key),
-            _ => {}
+            Screen::Log => {}
         }
     }
 
@@ -652,6 +797,9 @@ impl App {
             ListKind::Results => self.search.hits.len(),
             ListKind::BrowseFs => self.browse.filesystems.len(),
             ListKind::BrowseEntries => self.browse.entries.len(),
+            ListKind::DupeGroups => self.dupes.groups.len(),
+            ListKind::DupeMembers => self.dupes.members.len(),
+            ListKind::CoverageDrives => self.collections.coverage.as_ref().map(|c| c.drives.len()).unwrap_or(0),
         }
     }
 
@@ -667,6 +815,18 @@ impl App {
             }
             ListKind::BrowseFs => self.browse.fs_sel = i,
             ListKind::BrowseEntries => self.browse.sel = i,
+            ListKind::DupeGroups => {
+                self.dupes.focus_members = false;
+                if self.dupes.sel != i {
+                    self.dupes.sel = i;
+                    self.load_members();
+                }
+            }
+            ListKind::DupeMembers => {
+                self.dupes.focus_members = true;
+                self.dupes.member_sel = i;
+            }
+            ListKind::CoverageDrives => self.collections.drive_sel = i,
         }
     }
 
@@ -675,10 +835,16 @@ impl App {
         let inside = |r: Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
         match m.kind {
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let code = if m.kind == MouseEventKind::ScrollDown { KeyCode::Down } else { KeyCode::Up };
+                if matches!(self.modal, Some(Modal::Filters { .. })) {
+                    for _ in 0..3 {
+                        self.modal_key(KeyEvent::new(code, KeyModifiers::NONE));
+                    }
+                    return;
+                }
                 if self.modal.is_some() {
                     return;
                 }
-                let code = if m.kind == MouseEventKind::ScrollDown { KeyCode::Down } else { KeyCode::Up };
                 if self.screen == Screen::Search {
                     self.search.focused = false;
                 }
@@ -693,8 +859,22 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(modal) = self.hits.modal {
                     // Clicking outside an informational popup closes it.
-                    if !inside(modal) && matches!(self.modal, Some(Modal::Help) | Some(Modal::File(_))) {
+                    if !inside(modal)
+                        && matches!(self.modal, Some(Modal::Help) | Some(Modal::File(_)) | Some(Modal::Filters { .. }))
+                    {
                         self.modal = None;
+                        return;
+                    }
+                    let row = self.hits.filter_rows.iter().find(|(ry, _)| *ry == y).map(|(_, i)| *i);
+                    if let (Some(Modal::Filters { sel }), Some(i)) = (self.modal.as_mut(), row) {
+                        let double = *sel == i && self.last_click.is_some_and(|(t, _, j)| j == i && t.elapsed() < Duration::from_millis(450));
+                        *sel = i;
+                        self.last_click = Some((Instant::now(), ListKind::Results, i));
+                        if double {
+                            self.modal = None;
+                            self.last_click = None;
+                            self.insert_filter(i);
+                        }
                     }
                     return;
                 }
@@ -707,6 +887,12 @@ impl App {
                 if self.screen == Screen::Search && self.hits.search_input.is_some_and(inside) {
                     self.search.focused = true;
                     return;
+                }
+                if self.screen == Screen::Search {
+                    if let Some(&(_, q)) = self.hits.examples.iter().find(|(ry, _)| *ry == y) {
+                        self.use_example(q);
+                        return;
+                    }
                 }
                 let Some(list) = self.hits.list.filter(|l| inside(l.area)) else { return };
                 let i = list.offset + (y - list.area.y) as usize;
@@ -735,7 +921,7 @@ impl App {
         }
     }
 
-    fn move_sel(sel: &mut usize, len: usize, key: KeyCode) {
+    pub(crate) fn move_sel(sel: &mut usize, len: usize, key: KeyCode) {
         if len == 0 {
             *sel = 0;
             return;
@@ -766,6 +952,14 @@ impl App {
                     }
                 }
                 None => self.toast("That drive is not connected."),
+            },
+            KeyCode::Char('v') => match row.as_ref().and_then(|r| r.disk.clone()) {
+                Some(disk) => {
+                    if self.send(Command::Verify(disk.clone())) {
+                        self.toast(format!("Verifying likely duplicates on /dev/{disk}…"));
+                    }
+                }
+                None => self.toast("Connect the drive to verify its duplicates."),
             },
             KeyCode::Char('p') => {
                 if let Some(job) = self.ctl.as_ref().and_then(|c| c.job()) {
@@ -869,20 +1063,8 @@ impl App {
                 }
             }
             KeyCode::Char('b') => {
-                if let Some(h) = self.search.hits.get(self.search.sel).cloned() {
-                    if let Some(cat) = self.catalog() {
-                        let dir: Option<i64> = cat
-                            .conn()
-                            .query_row("SELECT dir_id FROM files WHERE id = ?1", [h.file_id], |r| r.get(0))
-                            .ok();
-                        if let Some(dir) = dir {
-                            self.open_dir(dir);
-                            if let Some(i) = self.browse.entries.iter().position(|e| !e.is_dir && e.id == h.file_id) {
-                                self.browse.sel = i;
-                            }
-                            self.screen = Screen::Browse;
-                        }
-                    }
+                if let Some(id) = self.search.hits.get(self.search.sel).map(|h| h.file_id) {
+                    self.browse_to_file(id);
                 }
             }
             _ => {}
@@ -976,6 +1158,27 @@ impl App {
                 }
                 _ => Some(modal),
             },
+            Modal::Filters { mut sel } => {
+                let n = di_core::filters::FILTERS.len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q') => None,
+                    KeyCode::Enter => {
+                        self.insert_filter(sel);
+                        None
+                    }
+                    KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => {
+                        Self::move_sel(&mut sel, n, key.code);
+                        Some(Modal::Filters { sel })
+                    }
+                    KeyCode::Char(c) => {
+                        // Jump to the next filter starting with the letter.
+                        let c = c.to_ascii_lowercase();
+                        let next = (1..=n).map(|d| (sel + d) % n).find(|i| di_core::filters::FILTERS[*i].key.starts_with(c));
+                        Some(Modal::Filters { sel: next.unwrap_or(sel) })
+                    }
+                    _ => Some(Modal::Filters { sel }),
+                }
+            }
             Modal::ConfirmQuit => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     self.quit = true;

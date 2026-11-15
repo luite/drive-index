@@ -35,9 +35,11 @@ pub fn scan_dir(req: &ScanRequest, quiet: bool) -> Result<ExitCode> {
             println!("Scanned D{} — {}.", out.drive_id, describe_outcome(&out, req.walk.threads));
             if let Some(c) = out.content.filter(|c| c.processed > 0) {
                 println!(
-                    "Read {} files for metadata and quick hashes ({} with metadata) in {}{}.",
+                    "Read {} {} for metadata and hashes ({} with metadata{}) in {}{}.",
                     format_count(c.processed),
+                    if c.processed == 1 { "file" } else { "files" },
                     format_count(c.media),
+                    if c.verified > 0 { format!(", {} duplicates verified by full hash", format_count(c.verified)) } else { String::new() },
                     di_model::units::format_duration(std::time::Duration::from_millis(c.ms)),
                     if c.cancelled { "; stopped, continues next time" } else { "" }
                 );

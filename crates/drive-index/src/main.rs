@@ -73,6 +73,12 @@ enum Command {
         /// Threads for the content phase [default: 2, kind to hard disks]
         #[arg(long)]
         content_threads: Option<usize>,
+        /// Read likely duplicates in full (BLAKE3) to verify them as exact duplicates
+        #[arg(long, conflicts_with = "no_content")]
+        verify: bool,
+        /// Drives: don't read SMART health with smartctl
+        #[arg(long)]
+        no_smart: bool,
         /// Drives: what to do afterwards
         #[arg(long, value_enum, default_value_t = AfterArg::Eject)]
         after: AfterArg,
@@ -120,11 +126,14 @@ enum Command {
         #[arg(long, short = 'q')]
         quiet: bool,
     },
-    /// Search the catalog (see PLAN.md §6 for the query language)
+    /// Search the catalog (`search --filters` lists the query language)
     Search {
         /// Query terms, e.g. ext:cr2,crw date:2014 size:>10M
-        #[arg(required = true, num_args = 1.., allow_hyphen_values = true)]
+        #[arg(required_unless_present = "filters", num_args = 1.., allow_hyphen_values = true)]
         query: Vec<String>,
+        /// Print the filter reference and exit
+        #[arg(long)]
+        filters: bool,
         #[arg(long, default_value_t = 100)]
         limit: usize,
         #[arg(long, value_enum, default_value_t = SortArg::Path)]
@@ -166,6 +175,43 @@ enum Command {
         #[arg(long)]
         generic: bool,
     },
+    /// Duplicate files: groups of copies, largest wasted space first
+    Dupes {
+        /// exact (verified full hash), likely (quick hash + size), probable (name + size)
+        #[arg(long, value_enum, default_value_t = ConfidenceArg::Likely)]
+        confidence: ConfidenceArg,
+        /// Ignore files smaller than this
+        #[arg(long, default_value = "1M")]
+        min_size: String,
+        /// Only files matching this search query (e.g. "in:photos-raw")
+        #[arg(long = "in", value_name = "QUERY")]
+        filter: Option<String>,
+        /// Only groups whose copies are all on one drive
+        #[arg(long)]
+        same_drive: bool,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// List each group's files
+        #[arg(long, short = 'f')]
+        files: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Which drives hold how much of a collection (photos-raw, video, …); without
+    /// an argument, lists the collections
+    Coverage {
+        collection: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// SMART health: read a connected drive now (disk4, /dev/sdb), or show the
+    /// readings stored for a catalogued drive (D3)
+    Smart {
+        target: String,
+        /// smartctl's JSON (device) or all stored readings (drive)
+        #[arg(long)]
+        json: bool,
+    },
     /// Set a drive's label (D3 or 3)
     Label {
         drive: String,
@@ -205,6 +251,13 @@ enum DbCmd {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ConfidenceArg {
+    Exact,
+    Likely,
+    Probable,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -287,6 +340,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             quiet,
             no_content,
             content_threads,
+            verify,
+            no_smart,
             after,
             new_drive,
             same_as,
@@ -297,6 +352,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 if let Some(n) = content_threads {
                     c.threads = n.max(1);
                 }
+                c.verify = verify;
                 c
             });
             let mut walk = walk_config(threads)?;
@@ -319,6 +375,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     identity,
                     allow_internal,
                     content,
+                    smart: !no_smart,
                 };
                 let _lock = lock::lock_or_fail(&req.catalog_path)?;
                 let session = SessionGuard::begin(&req.catalog_path, accept_stale)?;
@@ -385,7 +442,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             session.end()?;
             Ok(code)
         }
-        Command::Search { query, limit, sort, desc, count, json } => {
+        Command::Search { filters: true, json, .. } => {
+            output::print_filters(json)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Search { query, limit, sort, desc, count, json, .. } => {
             let query = query.join(" ");
             let cat = Catalog::open_readonly(&db)?;
             cmd_search(&cat, &query, limit, sort, desc, count, json)
@@ -401,6 +462,31 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Info { dev, all, json } => cmd_info(dev.as_deref(), all, json),
         Command::BenchWalk { dir, threads, generic } => cmd_bench_walk(&dir, threads, generic),
+        Command::Dupes { confidence, min_size, filter, same_drive, limit, files, json } => {
+            let cat = Catalog::open_readonly(&db)?;
+            let q = di_core::dupes::DupeQuery {
+                confidence: match confidence {
+                    ConfidenceArg::Exact => di_core::dupes::Confidence::Exact,
+                    ConfidenceArg::Likely => di_core::dupes::Confidence::Likely,
+                    ConfidenceArg::Probable => di_core::dupes::Confidence::Probable,
+                },
+                min_size: di_model::units::parse_size(&min_size).map_err(|e| anyhow::anyhow!("--min-size: {e}"))?,
+                filter,
+                same_drive_only: same_drive,
+                limit,
+            };
+            output::print_dupes(&cat, &q, files, json)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Coverage { collection, json } => {
+            let cat = Catalog::open_readonly(&db)?;
+            match collection {
+                Some(c) => output::print_coverage(&di_core::coverage::coverage(cat.conn(), &c)?, json)?,
+                None => output::print_collections(&di_core::coverage::collections(cat.conn())?, json)?,
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Smart { target, json } => cmd_smart(&db, &target, json),
         Command::Label { drive, label, clear } => {
             let id = parse_drive_id(&drive)?;
             if label.is_none() && !clear {
@@ -511,6 +597,31 @@ fn walk_config(threads: Option<usize>) -> Result<WalkConfig> {
     Ok(walk)
 }
 
+fn cmd_smart(db: &std::path::Path, target: &str, json: bool) -> Result<ExitCode> {
+    let catalogued = target.strip_prefix(['D', 'd']).is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+    if catalogued {
+        let id = parse_drive_id(target)?;
+        let cat = Catalog::open_readonly(db)?;
+        let history = di_core::smart::history(cat.conn(), id, if json { 1000 } else { 10 })?;
+        let access = di_core::smart::access(cat.conn(), id)?;
+        output::print_smart_history(id, &history, &access, json)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let probe = di_platform::probe(target)?;
+    match di_platform::smart::read(&probe, None) {
+        Ok(r) if json => println!("{}", r.raw_json),
+        Ok(r) => output::print_smart(&probe, &r),
+        Err(e) => {
+            eprintln!("{}: SMART unavailable: {}", probe.dev_path, e.reason());
+            if let di_model::smart::SmartUnavailable::NeedsRoot(_) = e {
+                eprintln!("Try: sudo drive-index smart {target}");
+            }
+            return Ok(ExitCode::FAILURE);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_search(cat: &Catalog, query: &str, limit: usize, sort: SortArg, desc: bool, count: bool, json: bool) -> Result<ExitCode> {
     let report = |e: SearchError| -> Result<ExitCode> {
         match e {
@@ -519,6 +630,7 @@ fn cmd_search(cat: &Catalog, query: &str, limit: usize, sort: SortArg, desc: boo
                 eprintln!("  {query}");
                 let width = query[q.start..q.end.min(query.len())].chars().count().max(1);
                 eprintln!("  {}{}", " ".repeat(query[..q.start].chars().count()), "^".repeat(width));
+                eprintln!("(drive-index search --filters lists every filter)");
                 Ok(ExitCode::from(2))
             }
             SearchError::Db(e) => Err(e.into()),

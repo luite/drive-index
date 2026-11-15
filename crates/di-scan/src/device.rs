@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 
 use di_core::Catalog;
 use di_core::drives::{DriveMatch, DriveRecord, FsRecord, PartitionRecord};
+use di_model::smart::{SmartReport, SmartUnavailable};
 use di_platform::{DriveProbe, VolumeProbe, identity};
 use di_walk::{Control, Progress, WalkConfig, host};
 
@@ -42,6 +43,8 @@ pub struct DeviceScanRequest {
     pub allow_internal: bool,
     /// Content phase per filesystem while mounted; None skips it.
     pub content: Option<crate::content::ContentConfig>,
+    /// Read SMART health (and the real disk serial) with smartctl.
+    pub smart: bool,
 }
 
 #[derive(Debug)]
@@ -73,12 +76,14 @@ pub struct DeviceReport {
     pub unmounted: bool,
     pub ejected: bool,
     pub interrupted: bool,
+    pub smart: Option<Result<SmartReport, SmartUnavailable>>,
 }
 
 /// Progress notifications for the caller (CLI line, TUI).
 #[derive(Debug)]
 pub enum Step<'a> {
     Identified { drive_id: i64, new: bool, probe: &'a DriveProbe },
+    Smart(&'a Result<SmartReport, SmartUnavailable>),
     Mounting(&'a VolumeProbe),
     Scanning { vol: &'a VolumeProbe, mount_point: &'a std::path::Path },
     Scanned(&'a VolumeProbe, &'a ScanOutcome),
@@ -148,15 +153,41 @@ pub fn to_fs_record(v: &VolumeProbe) -> FsRecord {
     }
 }
 
+/// Fill what the OS did not report from SMART, and add the disk's own identifiers.
+/// OS-reported values win, so a host without SMART access records the same drive.
+fn enrich(rec: &mut DriveRecord, s: &SmartReport) {
+    if rec.serial.is_none() {
+        rec.serial = s.serial.clone();
+    }
+    if rec.wwn.is_none() {
+        rec.wwn = s.wwn.clone();
+    }
+    if rec.firmware.is_none() {
+        rec.firmware = s.firmware.clone();
+    }
+    if rec.rotation_rpm.is_none() {
+        rec.rotation_rpm = s.rotation_rpm;
+    }
+    for i in identity::smart_identifiers(s) {
+        if !rec.identifiers.iter().any(|x| x.kind == i.kind && x.value == i.value) {
+            rec.identifiers.push(i);
+        }
+    }
+}
+
 /// Identify a probed drive and record it (and its filesystems) in the catalog.
 /// Returns `(drive_id, new, weak, filesystem ids in probe.volumes order)`.
 pub fn record_drive(
     catalog: &mut Catalog,
     probe: &DriveProbe,
+    smart: Option<&SmartReport>,
     choice: IdentityChoice,
     label: Option<&str>,
 ) -> Result<(i64, bool, bool, Vec<i64>)> {
-    let rec = to_record(probe);
+    let mut rec = to_record(probe);
+    if let Some(s) = smart {
+        enrich(&mut rec, s);
+    }
     let (existing, weak) = match choice {
         IdentityChoice::New => (None, false),
         IdentityChoice::SameAs(id) => {
@@ -203,9 +234,21 @@ pub fn scan_device(
     }
 
     let mut catalog = Catalog::open(&req.catalog_path)?;
+    let smart = req.smart.then(|| {
+        // The device type that worked for this drive last time saves the fallbacks.
+        let cached = match catalog.match_drive(&to_record(&probe)) {
+            Ok(DriveMatch::Known { drive_id, .. }) => di_core::smart::access(catalog.conn(), drive_id).ok().and_then(|a| a.device_type),
+            _ => None,
+        };
+        di_platform::smart::read(&probe, cached.as_deref())
+    });
     let (drive_id, new_drive, weak_match, fs_ids) =
-        record_drive(&mut catalog, &probe, req.identity, req.label.as_deref())?;
+        record_drive(&mut catalog, &probe, smart.as_ref().and_then(|r| r.as_ref().ok()), req.identity, req.label.as_deref())?;
     on_step(Step::Identified { drive_id, new: new_drive, probe: &probe });
+    if let Some(r) = &smart {
+        catalog.save_smart(drive_id, r)?;
+        on_step(Step::Smart(r));
+    }
 
     let mut report = DeviceReport {
         drive_id,
@@ -216,6 +259,7 @@ pub fn scan_device(
         unmounted: false,
         ejected: false,
         interrupted: false,
+        smart,
     };
 
     for (vol, &fs_id) in probe.volumes.iter().zip(&fs_ids) {
@@ -339,6 +383,16 @@ pub fn step_text(step: &Step, threads: usize) -> Option<String> {
             probe.bus.as_str(),
             if probe.volumes.is_empty() { ", no filesystems" } else { "" }
         ),
+        Step::Smart(Ok(s)) => {
+            let mut t = format!("  SMART: {}", s.summary());
+            for w in s.warnings() {
+                t.push_str(&format!("\n  ⚠ {w}"));
+            }
+            t
+        }
+        Step::Smart(Err(SmartUnavailable::NotInstalled)) => return None,
+        Step::Smart(Err(SmartUnavailable::Unsupported(m))) if m.starts_with("disk images") => return None,
+        Step::Smart(Err(e)) => format!("  SMART unavailable: {}", e.reason()),
         Step::Mounting(v) if v.mount_point.is_none() => {
             format!("  {} {} \"{}\": mounting read-only", v.dev, v.fs_type, v.label.as_deref().unwrap_or(""))
         }
@@ -363,6 +417,9 @@ pub fn step_text(step: &Step, threads: usize) -> Option<String> {
                 di_model::units::format_count(c.hashed),
                 di_model::units::format_duration(std::time::Duration::from_millis(c.ms))
             );
+            if c.verified > 0 {
+                t.push_str(&format!("; {} likely duplicates verified by full hash", di_model::units::format_count(c.verified)));
+            }
             if c.errors > 0 {
                 t.push_str(&format!("; {} unreadable", c.errors));
             }

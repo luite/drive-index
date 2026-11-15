@@ -46,15 +46,11 @@ impl QueryError {
 const KEYS: &[&str] = &[
     "name", "path", "ext", "type", "size", "date", "mtime", "btime", "ctime", "drive", "fs", "fstype",
     "kind", "in", "taken", "when", "camera", "lens", "iso", "focal", "aperture", "gps", "res", "width",
-    "height", "duration", "codec", "artist", "album", "title", "genre", "year", "media",
+    "height", "duration", "codec", "artist", "album", "title", "genre", "year", "media", "dup", "copies",
 ];
 
 /// Filters that exist in the language but need data from later milestones.
-const FUTURE_KEYS: &[(&str, &str)] = &[
-    ("online", "device detection in the search (coming)"),
-    ("dup", "duplicate detection (coming in M4)"),
-    ("copies", "duplicate detection (coming in M4)"),
-];
+const FUTURE_KEYS: &[(&str, &str)] = &[("online", "live device state in the search")];
 
 fn is_flag_key(key: &str) -> bool {
     flags::NAMED.iter().any(|(n, _)| *n == key)
@@ -93,11 +89,11 @@ pub fn parse(input: &str) -> Result<Vec<Term>, QueryError> {
         if j > key_start && j < n && bytes[j] == b':' {
             let k = input[key_start..j].to_ascii_lowercase();
             if !is_known_key(&k) {
-                return Err(QueryError {
-                    message: format!("unknown filter '{k}:' (known: {})", known_keys_hint()),
-                    start,
-                    end: j + 1,
-                });
+                let message = match crate::filters::closest_key(&k) {
+                    Some(c) => format!("unknown filter '{k}:' — did you mean '{c}:'?"),
+                    None => format!("unknown filter '{k}:' (known: {})", known_keys_hint()),
+                };
+                return Err(QueryError { message, start, end: j + 1 });
             }
             key = Some(k);
             i = j + 1;
@@ -321,6 +317,32 @@ impl Compiler<'_> {
                 let list = self.in_list("lower(s.codec)", codecs);
                 Ok(format!("EXISTS (SELECT 1 FROM media_streams s WHERE s.file_id = f.id AND {list})"))
             }
+            "dup" => {
+                let exact = "h.full IS NOT NULL AND EXISTS (SELECT 1 FROM file_hashes h2 WHERE h2.full = h.full AND h2.file_id != f.id)";
+                let likely = "h.quick IS NOT NULL AND EXISTS (SELECT 1 FROM file_hashes h2 JOIN files f2 ON f2.id = h2.file_id \
+                              WHERE h2.quick = h.quick AND f2.size = f.size AND h2.file_id != f.id)";
+                let probable = "EXISTS (SELECT 1 FROM files f2 WHERE f2.size = f.size AND f2.id != f.id AND f2.kind = 0 \
+                                AND lower(f2.name) = lower(f.name))";
+                let any = format!("({exact}) OR ({likely}) OR ({probable})");
+                Ok(match t.value.to_lowercase().as_str() {
+                    "exact" | "verified" => exact.to_string(),
+                    "likely" => likely.to_string(),
+                    "probable" => probable.to_string(),
+                    v => match parse_bool(v) {
+                        Some(true) => any,
+                        Some(false) => format!("NOT COALESCE(({any}), 0)"),
+                        None => return Err(QueryError::at(t, "'dup:' takes yes, no, exact, likely or probable")),
+                    },
+                })
+            }
+            "copies" => self.num_cond(
+                t,
+                "(SELECT count(DISTINCT fs2.drive_id) FROM files f2 JOIN filesystems fs2 ON fs2.id = f2.filesystem_id \
+                  LEFT JOIN file_hashes h2 ON h2.file_id = f2.id \
+                  WHERE f2.size = f.size AND f2.kind = 0 AND (CASE WHEN h.quick IS NOT NULL AND h2.quick IS NOT NULL \
+                  THEN h2.quick = h.quick ELSE lower(f2.name) = lower(f.name) END))",
+                |s| s.parse::<f64>().ok(),
+            ),
             "media" => {
                 let mut ors = Vec::new();
                 for alt in alternatives(&t.value) {

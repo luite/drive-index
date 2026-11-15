@@ -98,15 +98,15 @@ fn screens_render_and_respond() {
     assert!(s.contains("/Photos/2014/Iceland/IMG_4411.CR2"), "{s}");
     assert!(s.contains("Σ 2 files"));
 
-    // Query errors show a caret under the bad term.
+    // Query errors are explained; the hint line warns while typing.
     for _ in 0..7 {
         key(&mut app, KeyCode::Backspace);
     }
     type_text(&mut app, "bogus:1");
     wait(&mut app, |a| a.search.error.is_some());
     let s = render(&mut app, 140, 40);
-    assert!(s.contains("unknown filter 'bogus:'"), "{s}");
-    assert!(s.contains("^^^^^^"));
+    assert!(s.contains("✖ unknown filter 'bogus:'"), "{s}");
+    assert!(s.contains("bogus: is not a filter"), "{s}");
 
     // Detail popup from a result.
     for _ in 0..7 {
@@ -160,6 +160,29 @@ fn screens_render_and_respond() {
     // q quits (no scan running).
     key(&mut app, KeyCode::Char('q'));
     assert!(app.quit);
+}
+
+#[test]
+fn drive_detail_shows_smart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = catalog_with_photos(tmp.path());
+    {
+        let cat = di_core::Catalog::open(&db).unwrap();
+        let r = di_model::smart::SmartReport {
+            device_type: "sat".into(),
+            passed: Some(true),
+            temperature_c: Some(31),
+            power_on_hours: Some(12431),
+            reallocated_sectors: Some(0),
+            pending_sectors: Some(8),
+            ..Default::default()
+        };
+        cat.save_smart(1, &Ok(r)).unwrap();
+    }
+    let mut app = App::new(db, "test-host".into(), None, Some("t".into()));
+    let s = render(&mut app, 140, 40);
+    assert!(s.contains("PASSED · 31 °C · 12,431 h · realloc 0 · pending 8"), "{s}");
+    assert!(s.contains("⚠ 8 sectors pending reallocation"), "{s}");
 }
 
 #[test]
@@ -249,4 +272,74 @@ fn mouse_tabs_rows_double_click_and_scroll() {
     scroll(&mut app, false);
     assert_eq!(app.search.sel, 0);
     assert!(!app.search.focused, "scrolling up does not jump into the query box");
+}
+
+#[test]
+fn search_help_completes_and_explains() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = catalog_with_photos(tmp.path());
+    let mut app = App::new(db, "test-host".into(), None, Some("t".into()));
+    key(&mut app, KeyCode::Char('/'));
+
+    // Empty query: a cheat sheet with clickable examples.
+    let s = render(&mut app, 140, 40);
+    assert!(s.contains("Search help") && s.contains("Examples") && s.contains("camera:"), "{s}");
+    let (x, y) = find(&s, "dup:likely size:>100M");
+    click(&mut app, x, y);
+    assert_eq!(app.search.input.text(), "dup:likely size:>100M");
+    app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+
+    // A partial key: the hint explains it and Tab completes it.
+    type_text(&mut app, "siz");
+    let s = render(&mut app, 140, 40);
+    assert!(s.contains("size:>10M") && s.contains("binary"), "{s}");
+    key(&mut app, KeyCode::Tab);
+    assert_eq!(app.search.input.text(), "size:");
+    assert!(app.search.focused, "Tab completed instead of leaving the box");
+
+    // Several keys: Tab cycles through them.
+    app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    type_text(&mut app, "c");
+    key(&mut app, KeyCode::Tab);
+    let first = app.search.input.text().to_string();
+    key(&mut app, KeyCode::Tab);
+    let second = app.search.input.text().to_string();
+    assert!(first.starts_with('c') && first.ends_with(':') && first != second, "{first} {second}");
+    let s = render(&mut app, 140, 40);
+    assert!(s.contains("Tab ▸"), "{s}");
+
+    // Values: categories come from the catalog.
+    app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    wait(&mut app, |a| !a.vocab.categories.is_empty());
+    type_text(&mut app, "type:photo_r");
+    key(&mut app, KeyCode::Tab);
+    assert_eq!(app.search.input.text(), "type:photo_raw");
+    wait(&mut app, |a| a.search.hits.len() == 2);
+
+    // A misspelled key gets a suggestion that Tab applies.
+    app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    type_text(&mut app, "sise:");
+    let s = render(&mut app, 140, 40);
+    assert!(s.contains("did you mean size:?"), "{s}");
+    key(&mut app, KeyCode::Tab);
+    assert_eq!(app.search.input.text(), "size:");
+
+    // F1: the full reference; Enter adds the selected filter to the query.
+    app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    type_text(&mut app, "iceland");
+    key(&mut app, KeyCode::F(1));
+    let s = render(&mut app, 140, 40);
+    assert!(s.contains("Search filters") && s.contains("Photos & video"), "{s}");
+    key(&mut app, KeyCode::Char('t')); // jump to the first key starting with t: type
+    key(&mut app, KeyCode::Enter);
+    assert!(app.modal.is_none());
+    assert_eq!(app.search.input.text(), "iceland type:");
+    assert!(app.search.focused);
+
+    // Small terminals still draw.
+    let s = render(&mut app, 80, 24);
+    assert!(s.contains("drive-index"));
+    key(&mut app, KeyCode::F(1));
+    let s = render(&mut app, 80, 24);
+    assert!(s.contains("Search filters"));
 }

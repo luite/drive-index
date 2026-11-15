@@ -96,7 +96,7 @@ fn scan_search_rescan() {
     assert_eq!((summary.files, summary.bytes), (3, 77_000));
 
     // Errors are reported, not panics.
-    let req = SearchRequest { query: "dup:yes", sort: SortKey::Path, descending: false, limit: 10, offset: 0 };
+    let req = SearchRequest { query: "online:yes", sort: SortKey::Path, descending: false, limit: 10, offset: 0 };
     assert!(search(cat.conn(), &req).unwrap_err().to_string().contains("not built yet"));
 
     // Aggregates: root totals equal the scan totals.
@@ -304,4 +304,94 @@ fn content_phase_extracts_media_once() {
     assert_eq!(again.content.unwrap().processed, 0);
     assert_eq!(again.merge.media_carried, 9);
     assert_eq!(again.merge.hashes_carried, 11);
+}
+
+fn write_fill(path: &Path, bytes: usize, fill: u8) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut v = vec![fill; bytes];
+    v[bytes / 2] = fill.wrapping_add(1); // not all one byte
+    fs::write(path, v).unwrap();
+}
+
+#[test]
+fn duplicates_and_coverage_across_drives() {
+    use di_core::coverage::coverage;
+    use di_core::dupes::{Confidence, DupeQuery, groups, members};
+    const M: usize = 1 << 20;
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("index.db");
+    let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+    write_fill(&a.join("RAW/a.CR2"), 2 * M, 1); // content X
+    write_fill(&a.join("RAW/copy_of_a.CR2"), 2 * M, 1); // X again, same drive
+    write_fill(&a.join("RAW/b.CR2"), 2 * M, 2); // Y
+    write_fill(&a.join("RAW/c.CR2"), 3 * M, 3); // Z, only here
+    write_fill(&b.join("a.CR2"), 2 * M, 1); // X on the other drive
+    write_fill(&b.join("b.CR2"), 2 * M, 4); // same name and size as Y, different content
+    write_fill(&b.join("misc/d.bin"), 2 * M, 1); // X under another name
+
+    let content = |verify| Some(di_scan::content::ContentConfig { ffprobe: None, exiftool: None, verify, ..Default::default() });
+    let run = |dir: &Path, verify: bool| {
+        let mut req = request(&db, dir);
+        req.label = None;
+        req.content = content(verify);
+        run_dir_scan(&req, &Control::default(), &Progress::default(), &PhaseCell::default()).unwrap()
+    };
+    let (da, db_) = (run(&a, false).drive_id, run(&b, false).drive_id);
+    assert_ne!(da, db_);
+
+    let cat = Catalog::open_readonly(&db).unwrap();
+    let q = |confidence, filter: Option<&str>, same_drive_only| DupeQuery {
+        confidence,
+        min_size: 0,
+        filter: filter.map(str::to_string),
+        same_drive_only,
+        limit: 100,
+    };
+    let (g, sum) = groups(cat.conn(), &q(Confidence::Likely, None, false)).unwrap();
+    assert_eq!(g.len(), 1, "{g:?}");
+    assert_eq!((g[0].copies, g[0].size, g[0].wasted), (4, 2 * M as u64, 6 * M as u64));
+    assert_eq!(g[0].drives.len(), 2);
+    assert_eq!((sum.groups, sum.files), (1, 4));
+    let m = members(cat.conn(), Confidence::Likely, &g[0].key, g[0].size).unwrap();
+    assert_eq!(m.iter().map(|m| m.path.as_str()).collect::<BTreeSet<_>>(), set(&["/RAW/a.CR2", "/RAW/copy_of_a.CR2", "/a.CR2", "/misc/d.bin"]).iter().map(String::as_str).collect());
+
+    let (g, _) = groups(cat.conn(), &q(Confidence::Likely, Some("ext:cr2"), false)).unwrap();
+    assert_eq!(g[0].copies, 3);
+    assert!(groups(cat.conn(), &q(Confidence::Likely, None, true)).unwrap().0.is_empty(), "the group spans two drives");
+    let (g, _) = groups(cat.conn(), &q(Confidence::Probable, None, false)).unwrap();
+    assert_eq!(g.len(), 2, "a.cr2 and b.cr2 by name and size: {g:?}");
+    assert!(groups(cat.conn(), &q(Confidence::Exact, None, false)).unwrap().0.is_empty(), "nothing verified yet");
+
+    // Search filters agree.
+    assert_eq!(paths(&cat, "dup:likely").len(), 4);
+    assert_eq!(paths(&cat, "dup:probable").len(), 4);
+    assert_eq!(paths(&cat, "type:photo_raw copies:1"), set(&["/RAW/b.CR2", "/RAW/c.CR2", "/b.CR2"]));
+    assert_eq!(paths(&cat, "copies:2").len(), 4);
+
+    // Coverage of RAW photos: items X, Y, Z (drive A) and Y' (drive B).
+    let c = coverage(cat.conn(), "photos-raw").unwrap();
+    assert_eq!(c.items, 4, "{c:?}");
+    assert_eq!(c.redundancy, [3, 1, 0]);
+    assert_eq!(c.hashed_items, 4);
+    let on = |d: i64| c.drives.iter().find(|x| x.drive_id == d).unwrap();
+    assert_eq!((on(da).items, on(da).only_items, on(da).files), (3, 2, 4));
+    assert_eq!((on(db_).items, on(db_).only_items), (2, 1));
+    assert!((on(da).pct - 75.0).abs() < 0.01);
+    assert_eq!(c.only_bytes, (2 + 3 + 2) * M as u64);
+    assert!(coverage(cat.conn(), "nope").is_err());
+    drop(cat);
+
+    // Verification: full hashes turn likely duplicates into exact ones.
+    let out = run(&b, true);
+    assert_eq!(out.content.unwrap().verified, 2, "a.CR2 and d.bin on B");
+    let out = run(&a, true);
+    assert_eq!(out.content.unwrap().verified, 2, "a.CR2 and its copy on A");
+    let cat = Catalog::open_readonly(&db).unwrap();
+    let (g, _) = groups(cat.conn(), &q(Confidence::Exact, None, false)).unwrap();
+    assert_eq!((g.len(), g[0].copies), (1, 4));
+    assert_eq!(paths(&cat, "dup:exact").len(), 4);
+    // A rescan does not read anything again.
+    drop(cat);
+    let out = run(&b, true);
+    assert_eq!(out.content.unwrap().verified, 0);
 }

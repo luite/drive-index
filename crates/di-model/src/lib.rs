@@ -7,6 +7,7 @@ pub mod flags;
 pub mod identity;
 pub mod names;
 pub mod parttypes;
+pub mod smart;
 pub mod units;
 
 /// Type and usage of a mounted filesystem (from statfs/statvfs).

@@ -78,11 +78,12 @@ pub enum SearchError {
     Db(#[from] rusqlite::Error),
 }
 
-const FROM: &str = "FROM files f
+pub const FROM: &str = "FROM files f
     JOIN dirs di        ON di.id = f.dir_id
     JOIN filesystems fs ON fs.id = f.filesystem_id
     JOIN drives d       ON d.id = fs.drive_id
-    LEFT JOIN media m   ON m.file_id = f.id";
+    LEFT JOIN media m   ON m.file_id = f.id
+    LEFT JOIN file_hashes h ON h.file_id = f.id";
 
 /// Short media summary of a hit (for result lists).
 #[derive(Debug, Clone, Default, Serialize)]

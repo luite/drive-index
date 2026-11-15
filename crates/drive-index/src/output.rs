@@ -283,3 +283,231 @@ pub fn print_doctor(r: &di_doctor::Report, db: &std::path::Path, state: &std::pa
     println!("Catalog: {} ({size})", db.display());
     println!("Host state: {}", state.display());
 }
+
+/// The search language reference (`search --filters`).
+pub fn print_filters(json: bool) -> anyhow::Result<()> {
+    use di_core::filters::{EXAMPLES, FILTERS, TIPS};
+    if json {
+        println!("{}", serde_json::to_string_pretty(FILTERS)?);
+        return Ok(());
+    }
+    let mut group = "";
+    for d in FILTERS {
+        if d.group != group {
+            group = d.group;
+            println!("\n{group}");
+        }
+        println!("  {:<46} {}", d.syntax, d.help);
+        if !d.examples.is_empty() {
+            println!("  {:<46} e.g. {}", "", d.examples.join("   "));
+        }
+    }
+    println!("\nTips");
+    for t in TIPS {
+        println!("  {t}");
+    }
+    println!("\nExamples");
+    for (q, what) in EXAMPLES {
+        println!("  {q:<40} {what}");
+    }
+    Ok(())
+}
+
+pub fn print_dupes(cat: &di_core::Catalog, q: &di_core::dupes::DupeQuery, files: bool, json: bool) -> Result<()> {
+    use di_core::dupes::{groups, members};
+    let conn = cat.conn();
+    let (list, sum) = groups(conn, q)?;
+    if json {
+        let out: Vec<serde_json::Value> = list
+            .iter()
+            .map(|g| {
+                let mut v = serde_json::to_value(g).unwrap();
+                if files {
+                    v["files"] = serde_json::to_value(members(conn, q.confidence, &g.key, g.size).unwrap_or_default()).unwrap();
+                }
+                v
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "summary": sum, "groups": out }))?);
+        return Ok(());
+    }
+    println!(
+        "{} duplicate groups ({}), {} files, {} in extra copies",
+        format_count(sum.groups),
+        q.confidence.as_str(),
+        format_count(sum.files),
+        format_size(sum.wasted)
+    );
+    if list.is_empty() {
+        if q.confidence == di_core::dupes::Confidence::Exact {
+            println!("Exact duplicates need full hashes: scan connected drives with --verify.");
+        }
+        return Ok(());
+    }
+    println!();
+    println!("{:>10} {:>6} {:>10}  {:<18} Name", "Size", "Copies", "Extra", "Drives");
+    for g in &list {
+        let drives: Vec<String> = g.drives.iter().map(|d| format!("D{d}")).collect();
+        println!(
+            "{:>10} {:>6} {:>10}  {:<18} {}",
+            format_size(g.size),
+            g.copies,
+            format_size(g.wasted),
+            clip(&drives.join(" "), 18),
+            g.name
+        );
+        if files {
+            for m in members(conn, q.confidence, &g.key, g.size)? {
+                println!("{:>30}  D{:<3} {}", "", m.drive_id, m.path);
+            }
+        }
+    }
+    if (sum.groups as usize) > list.len() {
+        println!("… {} more groups (--limit)", format_count(sum.groups - list.len() as u64));
+    }
+    Ok(())
+}
+
+pub fn print_collections(list: &[di_core::coverage::Collection], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(list)?);
+        return Ok(());
+    }
+    println!("{:<16} {:<24} Query", "Slug", "Name");
+    for c in list {
+        println!("{:<16} {:<24} {}", c.slug, c.name, c.query);
+    }
+    println!("\n`drive-index coverage <slug>` shows which drives hold it.");
+    Ok(())
+}
+
+pub fn print_coverage(c: &di_core::coverage::Coverage, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(c)?);
+        return Ok(());
+    }
+    let total = c.items.max(1) as f64;
+    println!("{} (in:{}, {})", c.collection.name, c.collection.slug, c.collection.query);
+    println!(
+        "{} items, {}; {} identified by content hash",
+        format_count(c.items),
+        format_size(c.bytes),
+        format_count(c.hashed_items)
+    );
+    for (label, n) in ["1 copy", "2 copies", "3+ copies"].iter().zip(c.redundancy) {
+        println!("  {label:<10} {:>10} ({:>3.0}%)", format_count(n), 100.0 * n as f64 / total);
+    }
+    if c.redundancy[0] > 0 {
+        println!(
+            "  {} on a single drive: drive-index search in:{} copies:1",
+            format_size(c.only_bytes),
+            c.collection.slug
+        );
+    }
+    println!();
+    println!("{:<22} {:>10} {:>6} {:>10} {:>20}  {:<16} SMART", "Drive", "Items", "Share", "Size", "Only here", "Last seen");
+    for d in &c.drives {
+        let label = format!("D{} {}", d.drive_id, d.label.as_deref().unwrap_or(""));
+        let only = if d.only_items > 0 { format!("{} ({})", format_count(d.only_items), format_size(d.only_bytes)) } else { "-".into() };
+        let smart = match d.smart_passed {
+            Some(true) => "ok",
+            Some(false) => "FAILING",
+            None => "-",
+        };
+        println!(
+            "{:<22} {:>10} {:>5.0}% {:>10} {:>20}  {:<16} {smart}",
+            clip(&label, 22),
+            format_count(d.items),
+            d.pct,
+            format_size(d.bytes),
+            only,
+            local_secs(Some(d.last_seen_at))
+        );
+    }
+    if !c.years.is_empty() {
+        println!();
+        let max = c.years.iter().map(|(_, n)| *n).max().unwrap_or(1).max(1) as f64;
+        for (y, n) in &c.years {
+            println!("  {y}  {:<40} {}", "█".repeat(((*n as f64 / max) * 40.0).ceil() as usize), format_count(*n));
+        }
+    }
+    Ok(())
+}
+
+fn opt<T: std::fmt::Display>(v: &Option<T>) -> String {
+    v.as_ref().map(|x| x.to_string()).unwrap_or_else(|| "-".into())
+}
+
+pub fn print_smart(p: &di_platform::DriveProbe, r: &di_model::smart::SmartReport) {
+    println!("{} — {} {}", p.dev_path, r.model.as_deref().or(p.model.as_deref()).unwrap_or("drive"), format_size(p.capacity_bytes));
+    println!("  Health      {}", r.summary());
+    for w in r.warnings() {
+        println!("  ⚠ {w}");
+    }
+    println!("  Protocol    {} (smartctl -d {})", opt(&r.protocol), r.device_type);
+    println!("  Serial      {}", opt(&r.serial));
+    println!("  WWN         {}", opt(&r.wwn));
+    println!("  Firmware    {}", opt(&r.firmware));
+    if let Some(rpm) = r.rotation_rpm {
+        println!("  Rotation    {}", if rpm == 0 { "solid state".to_string() } else { format!("{rpm} rpm") });
+    }
+    println!("  Power       {} hours, {} cycles", opt(&r.power_on_hours), opt(&r.power_cycles));
+    if r.nvme_unsafe_shutdowns.is_some() {
+        println!("  Unsafe shutdowns {}", opt(&r.nvme_unsafe_shutdowns));
+    }
+    if r.udma_crc_errors.is_some() {
+        println!("  CRC errors  {}", opt(&r.udma_crc_errors));
+    }
+}
+
+pub fn print_smart_history(
+    id: i64,
+    history: &[di_core::smart::SmartView],
+    access: &di_core::smart::SmartAccess,
+    json: bool,
+) -> Result<()> {
+    if json {
+        let rows: Vec<serde_json::Value> = history
+            .iter()
+            .map(|h| {
+                let r = &h.report;
+                serde_json::json!({
+                    "taken_at": h.taken_at, "passed": r.passed, "temperature_c": r.temperature_c,
+                    "power_on_hours": r.power_on_hours, "power_cycles": r.power_cycles,
+                    "reallocated_sectors": r.reallocated_sectors, "pending_sectors": r.pending_sectors,
+                    "offline_uncorrectable": r.offline_uncorrectable, "udma_crc_errors": r.udma_crc_errors,
+                    "nvme_percentage_used": r.nvme_percentage_used, "nvme_available_spare": r.nvme_available_spare,
+                    "nvme_media_errors": r.nvme_media_errors, "nvme_unsafe_shutdowns": r.nvme_unsafe_shutdowns,
+                    "data_written_bytes": r.data_written_bytes,
+                })
+            })
+            .collect();
+        let out = serde_json::json!({
+            "drive_id": id,
+            "available": access.available,
+            "unavailable_reason": access.reason,
+            "device_type": access.device_type,
+            "readings": rows,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+    if history.is_empty() {
+        match &access.reason {
+            Some(r) => println!("D{id}: no SMART readings ({r})."),
+            None => println!("D{id}: no SMART readings yet; they are taken when the drive is scanned."),
+        }
+        return Ok(());
+    }
+    println!("D{id} SMART readings, newest first:");
+    for h in history {
+        println!("  {}  {}", local_secs(Some(h.taken_at)), h.report.summary());
+    }
+    for w in history[0].report.warnings() {
+        println!("  ⚠ {w}");
+    }
+    if let Some(r) = &access.reason {
+        println!("  (last attempt: {r})");
+    }
+    Ok(())
+}

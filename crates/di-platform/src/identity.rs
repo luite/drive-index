@@ -31,6 +31,19 @@ fn is_junk_serial(s: &str) -> bool {
     lower.chars().all(|c| c == first)
 }
 
+/// Identifiers of the disk itself as smartctl reports it (behind any USB bridge).
+pub fn smart_identifiers(s: &di_model::smart::SmartReport) -> Vec<Identifier> {
+    let mut out = Vec::new();
+    if let Some(w) = s.wwn.as_deref().filter(|w| !is_junk_serial(w)) {
+        out.push(Identifier { kind: "wwn".into(), value: w.trim().to_ascii_lowercase(), strength: WWN });
+    }
+    if let Some(serial) = s.serial.as_deref().map(str::trim).filter(|v| !v.is_empty() && !is_junk_serial(v)) {
+        let model = s.model.as_deref().unwrap_or("").trim();
+        out.push(Identifier { kind: "disk_serial".into(), value: format!("{model}|{serial}"), strength: DISK_SERIAL });
+    }
+    out
+}
+
 /// All identifiers of a probed drive.
 pub fn identifiers(d: &DriveProbe) -> Vec<Identifier> {
     let mut out = Vec::new();

@@ -27,6 +27,15 @@ impl LineEdit {
         self.cursor = text.chars().count();
     }
 
+    /// Replace chars `start..end` with `with`, leaving the cursor after it.
+    pub fn replace(&mut self, start: usize, end: usize, with: &str) {
+        let len = self.text.chars().count();
+        let (start, end) = (start.min(len), end.min(len).max(start.min(len)));
+        let (a, b) = (self.byte_at(start), self.byte_at(end));
+        self.text.replace_range(a..b, with);
+        self.cursor = start + with.chars().count();
+    }
+
     fn byte_at(&self, char_idx: usize) -> usize {
         self.text.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(self.text.len())
     }

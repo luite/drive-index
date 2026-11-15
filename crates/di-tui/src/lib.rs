@@ -1,7 +1,9 @@
 //! The interactive terminal UI (PLAN.md §7).
 
 pub mod app;
+pub mod assist;
 pub mod input;
+pub mod screens;
 pub mod search_worker;
 pub mod ui;
 

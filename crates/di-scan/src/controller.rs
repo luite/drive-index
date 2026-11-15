@@ -94,6 +94,8 @@ pub enum Event {
 #[derive(Debug, Clone)]
 pub enum Command {
     Scan { disk: String, identity: IdentityChoice, label: Option<String> },
+    /// Rescan and full-hash likely duplicates on the drive (making them exact).
+    Verify(String),
     Pause,
     Resume,
     Cancel,
@@ -183,6 +185,7 @@ struct Job {
     disk: String,
     identity: IdentityChoice,
     label: Option<String>,
+    verify: bool,
 }
 
 struct Active {
@@ -275,7 +278,17 @@ impl State {
                     self.log(Level::Info, format!("/dev/{disk} is already being scanned or queued."));
                 } else {
                     self.handled.insert(disk.clone());
-                    self.queue.push_back(Job { disk, identity, label });
+                    self.queue.push_back(Job { disk, identity, label, verify: false });
+                }
+            }
+            Command::Verify(disk) => {
+                let busy = self.active.as_ref().is_some_and(|a| a.disk == disk) || self.queue.iter().any(|j| j.disk == disk);
+                if busy {
+                    self.log(Level::Info, format!("/dev/{disk} is already being scanned or queued."));
+                } else {
+                    self.handled.insert(disk.clone());
+                    self.log(Level::Info, format!("Verifying likely duplicates on /dev/{disk} (rescan + full hashes)."));
+                    self.queue.push_back(Job { disk, identity: IdentityChoice::Auto, label: None, verify: true });
                 }
             }
             Command::Pause => {
@@ -351,7 +364,7 @@ impl State {
             let Ok(probe) = di_platform::probe(&id) else { continue };
             let (drive_id, label, outcome) = self.decide(&probe);
             if outcome == Outcome::Queued {
-                self.queue.push_back(Job { disk: id.clone(), identity: IdentityChoice::Auto, label: None });
+                self.queue.push_back(Job { disk: id.clone(), identity: IdentityChoice::Auto, label: None, verify: false });
             }
             if matches!(outcome, Outcome::Ignored(_)) && !probe.is_external() {
                 continue; // internal disks: not worth an event
@@ -388,7 +401,7 @@ impl State {
             Ok(DriveMatch::Ambiguous(c)) => (None, None, Outcome::Ask(Question::Ambiguous(c))),
             Ok(DriveMatch::Known { drive_id, .. }) => {
                 // Record the connection, then check how fresh each filesystem's scan is.
-                let fs_ids = match record_drive(&mut catalog, probe, IdentityChoice::SameAs(drive_id), None) {
+                let fs_ids = match record_drive(&mut catalog, probe, None, IdentityChoice::SameAs(drive_id), None) {
                     Ok((_, _, _, ids)) => ids,
                     Err(e) => return (Some(drive_id), None, Outcome::Ignored(format!("{e:#}"))),
                 };
@@ -458,7 +471,8 @@ impl State {
             after: self.opts.policy.after,
             identity: job.identity,
             allow_internal: false,
-            content: Some(crate::content::ContentConfig::default()),
+            content: Some(crate::content::ContentConfig { verify: job.verify, ..Default::default() }),
+            smart: true,
         };
         let (progress, phase, ev) = (self.progress.clone(), self.phase.clone(), self.ev.clone());
         let releasing = Arc::new(AtomicBool::new(false));

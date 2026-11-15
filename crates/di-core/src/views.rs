@@ -33,6 +33,11 @@ pub struct DriveDetail {
     pub connect_count: i64,
     pub partitions: Vec<PartitionRow>,
     pub filesystems: Vec<FsRow>,
+    /// Latest SMART reading.
+    #[serde(skip)]
+    pub smart: Option<crate::smart::SmartView>,
+    /// Why SMART could not be read the last time.
+    pub smart_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,6 +105,8 @@ pub fn drive_detail(conn: &Connection, drive_id: i64) -> Result<Option<DriveDeta
                     connect_count: r.get(21)?,
                     partitions: Vec::new(),
                     filesystems: Vec::new(),
+                    smart: None,
+                    smart_reason: None,
                 })
             },
         )
@@ -151,6 +158,8 @@ pub fn drive_detail(conn: &Connection, drive_id: i64) -> Result<Option<DriveDeta
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
+    d.smart = crate::smart::latest(conn, drive_id)?;
+    d.smart_reason = crate::smart::access(conn, drive_id)?.reason;
     Ok(Some(d))
 }
 

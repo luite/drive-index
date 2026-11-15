@@ -30,6 +30,9 @@ pub struct ContentConfig {
     pub min_candidate_size: u64,
     pub ffprobe: Option<PathBuf>,
     pub exiftool: Option<PathBuf>,
+    /// Full-hash files whose quick hash matches another file's ("likely"
+    /// duplicates), turning them into verified ("exact") duplicates.
+    pub verify: bool,
 }
 
 impl Default for ContentConfig {
@@ -41,6 +44,7 @@ impl Default for ContentConfig {
             min_candidate_size: 1 << 20,
             ffprobe: di_media::locate_tool("ffprobe"),
             exiftool: di_media::locate_tool("exiftool"),
+            verify: false,
         }
     }
 }
@@ -50,6 +54,7 @@ pub struct ContentOutcome {
     pub processed: u64,
     pub media: u64,
     pub hashed: u64,
+    pub verified: u64,
     pub errors: u64,
     pub bytes_read: u64,
     pub cancelled: bool,
@@ -61,6 +66,7 @@ struct Work {
     path: PathBuf,
     kind: Option<MediaKind>,
     want_hash: bool,
+    want_full: bool,
     inode: i64,
 }
 
@@ -127,10 +133,20 @@ fn pending(conn: &Connection, fs: i64, root: &Path, cfg: &ContentConfig) -> Resu
     } else {
         HashSet::new()
     };
+    // Quick hashes shared by more than one file of the same size: verification candidates.
+    let likely: HashSet<(Vec<u8>, i64)> = if cfg.verify {
+        let mut stmt = conn.prepare(
+            "SELECT h.quick, f.size FROM file_hashes h JOIN files f ON f.id = h.file_id
+             WHERE h.quick IS NOT NULL GROUP BY h.quick, f.size HAVING count(*) > 1",
+        )?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+    } else {
+        HashSet::new()
+    };
     let dirs = dir_paths(conn, fs)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT f.id, f.dir_id, f.name, f.name_raw, f.size, COALESCE(f.inode, 0), c.category,
-                h.file_id IS NOT NULL, m.status, m.extractor
+                h.file_id IS NOT NULL, m.status, m.extractor, h.quick, h.full IS NOT NULL
          FROM files f
          LEFT JOIN ext_categories c ON c.ext = f.ext
          LEFT JOIN file_hashes h ON h.file_id = f.id
@@ -156,7 +172,10 @@ fn pending(conn: &Connection, fs: i64, root: &Path, cfg: &ContentConfig) -> Resu
                 Some(_) => false,
             };
         let want_hash = !has_hash && (needs_media || kind.is_some() || candidate_sizes.contains(&size));
-        if !needs_media && !want_hash {
+        let quick: Option<Vec<u8>> = r.get(10)?;
+        let has_full: bool = r.get(11)?;
+        let want_full = cfg.verify && !has_full && quick.is_some_and(|q| likely.contains(&(q, size)));
+        if !needs_media && !want_hash && !want_full {
             continue;
         }
         let Some(dir) = dirs.get(&dir_id) else { continue };
@@ -167,6 +186,7 @@ fn pending(conn: &Connection, fs: i64, root: &Path, cfg: &ContentConfig) -> Resu
             path: root.join(OsStr::from_bytes(&rel)),
             kind: if needs_media { kind } else { None },
             want_hash,
+            want_full,
             inode,
         });
     }
@@ -198,7 +218,8 @@ pub fn run_content(
         let _ = work_tx.send(w);
     }
     drop(work_tx);
-    let (res_tx, res_rx) = crossbeam_channel::bounded::<(i64, std::io::Result<Extracted>)>(256);
+    type Res = (i64, std::io::Result<Extracted>, Option<[u8; 32]>);
+    let (res_tx, res_rx) = crossbeam_channel::bounded::<Res>(256);
 
     std::thread::scope(|s| -> Result<()> {
         for _ in 0..cfg.threads.max(1) {
@@ -213,8 +234,21 @@ pub fn run_content(
                         break;
                     }
                     progress.set_current(&w.path.to_string_lossy());
-                    let r = ex.extract(&w.path, w.kind, w.want_hash);
-                    if res_tx.send((w.file_id, r)).is_err() {
+                    let r = if w.kind.is_some() || w.want_hash {
+                        ex.extract(&w.path, w.kind, w.want_hash)
+                    } else {
+                        Ok(Extracted { quick_hash: None, media: None, bytes_read: 0 })
+                    };
+                    let full = if w.want_full && r.is_ok() {
+                        di_media::full_hash(&w.path, &|| control.is_cancelled(), &|n| {
+                            progress.content_bytes.fetch_add(n, Ordering::Relaxed);
+                        })
+                        .ok()
+                        .flatten()
+                    } else {
+                        None
+                    };
+                    if res_tx.send((w.file_id, r, full)).is_err() {
                         break;
                     }
                 }
@@ -227,7 +261,7 @@ pub fn run_content(
         let mut tx = conn.transaction()?;
         let mut in_tx = 0usize;
         let mut last = Instant::now();
-        for (file_id, r) in res_rx.iter() {
+        for (file_id, r, full) in res_rx.iter() {
             progress.content_done.fetch_add(1, Ordering::Relaxed);
             outcome.processed += 1;
             match r {
@@ -245,6 +279,10 @@ pub fn run_content(
                     if let Some(m) = &e.media {
                         save_media(&tx, file_id, m)?;
                         outcome.media += 1;
+                    }
+                    if let Some(full) = full {
+                        tx.execute("UPDATE file_hashes SET full = ?2 WHERE file_id = ?1", params![file_id, full.as_slice()])?;
+                        outcome.verified += 1;
                     }
                 }
                 // Unreadable now (permissions, unplugged): not recorded, retried next time.

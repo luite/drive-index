@@ -17,6 +17,7 @@ use di_scan::Phase;
 use di_scan::controller::Level;
 
 use crate::app::{App, ConnStatus, ListHit, ListKind, Modal, Screen};
+use crate::assist;
 
 // -------------------------------------------------------------------------------------
 // Styling (16-colour safe, NO_COLOR respected)
@@ -95,23 +96,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits.list = None;
     app.hits.search_input = None;
     app.hits.modal = None;
+    app.hits.examples.clear();
+    app.hits.filter_rows.clear();
     draw_tabs(f, app, top);
     match app.screen {
         Screen::Drives => draw_drives(f, app, body),
         Screen::Search => draw_search(f, app, body),
         Screen::Browse => draw_browse(f, app, body),
-        Screen::Dupes => draw_placeholder(
-            f,
-            body,
-            "Duplicates",
-            "Duplicate detection needs content hashes, which arrive with the content phase in M4.",
-        ),
-        Screen::Collections => draw_placeholder(
-            f,
-            body,
-            "Collections",
-            "Collection coverage (\"which drives hold how much of my RAW photos\") arrives in M4. Meanwhile, search with in:photos-raw.",
-        ),
+        Screen::Dupes => draw_dupes(f, app, body),
+        Screen::Collections => draw_collections(f, app, body),
         Screen::Log => draw_log(f, app, body),
         Screen::Setup => draw_setup(f, app, body),
     }
@@ -171,22 +164,21 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_keys(f: &mut Frame, app: &App, area: Rect) {
     let keys = match app.screen {
-        Screen::Drives => "s scan  p pause/resume  x stop  u unmount  e eject  l label  n notes  b browse",
-        Screen::Search if app.search.focused => "type a query  ⏎/↓ results  esc leave the box",
-        Screen::Search => "⏎ details  s sort  d reverse  c copy path  b browse here  i/↑ edit query",
+        Screen::Drives => "s scan  v verify dupes  p pause/resume  x stop  u unmount  e eject  l label  n notes  b browse",
+        Screen::Search if app.search.focused => "type a query  Tab complete  ⏎/↓ results  F1 all filters  esc leave the box",
+        Screen::Search => "⏎ details  s sort  d reverse  c copy path  b browse here  i/↑ edit query  F1 filters",
         Screen::Browse => "⏎/→ open  ←/⌫ up  s sort",
         Screen::Setup => "r re-check  c copy install command  H hand off a catalog copy",
+        Screen::Dupes if app.dupes.editing.is_some() => "type a search query to limit the files  ⏎ apply  esc cancel",
+        Screen::Dupes if app.dupes.focus_members => "⏎ details  b browse  ←/esc back to groups",
+        Screen::Dupes => "c confidence  m min size  x same drive only  f scope  →/⏎ copies  b browse  r reload",
+        Screen::Collections => "←/→ collection  ⏎ files on drive  o only on drive  a at-risk files (1 copy)  r reload",
         _ => "",
     };
     f.render_widget(
         Line::from(vec![Span::styled(format!(" {keys}"), dim()), Span::styled("   1-7 screens  / search  ? help  q quit", dim())]),
         area,
     );
-}
-
-fn draw_placeholder(f: &mut Frame, area: Rect, title: &str, text: &str) {
-    let p = Paragraph::new(text).block(block(title)).wrap(Wrap { trim: true }).alignment(Alignment::Center);
-    f.render_widget(p, centered(area, 70, 7));
 }
 
 // -------------------------------------------------------------------------------------
@@ -292,6 +284,26 @@ fn draw_drive_detail(f: &mut Frame, app: &App, area: Rect) {
                     ago(d.last_scanned_at)
                 ),
             ));
+            match (&d.smart, &d.smart_reason) {
+                (Some(sv), _) => {
+                    let style = match sv.report.passed {
+                        Some(false) => fg(Color::Red).add_modifier(Modifier::BOLD),
+                        _ if !sv.report.warnings().is_empty() => fg(Color::Yellow),
+                        Some(true) => fg(Color::Green),
+                        None => Style::new(),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{:<10}", "SMART"), dim()),
+                        Span::styled(sv.report.summary(), style),
+                        Span::styled(format!("  ({})", ago(Some(sv.taken_at))), dim()),
+                    ]));
+                    for w in sv.report.warnings() {
+                        lines.push(Line::from(vec![Span::raw(" ".repeat(10)), Span::styled(format!("⚠ {w}"), fg(Color::Yellow))]));
+                    }
+                }
+                (None, Some(reason)) => lines.push(Line::from(vec![Span::styled(format!("{:<10}", "SMART"), dim()), Span::styled(format!("unavailable: {reason}"), dim())])),
+                (None, None) => lines.push(kv("SMART", "no reading yet (taken when the drive is scanned)")),
+            }
             if let Some(n) = &d.notes {
                 lines.push(kv("Notes", n.clone()));
             }
@@ -442,18 +454,71 @@ fn draw_jobs(f: &mut Frame, app: &App, area: Rect) {
 // -------------------------------------------------------------------------------------
 
 fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
-    let [input_area, results_area] = Layout::vertical([Constraint::Length(5), Constraint::Min(5)]).areas(area);
+    let focused = app.search.focused;
+    let box_h = if focused { 6 } else { 4 };
+    let [input_area, results_area] = Layout::vertical([Constraint::Length(box_h), Constraint::Min(5)]).areas(area);
+    let inner_w = input_area.width.saturating_sub(2) as usize;
     let s = &app.search;
-    let mut lines = vec![Line::from(vec![Span::styled("> ", bold()), Span::raw(s.input.text().to_string())])];
+    let q = s.input.text();
+
+    // The query, with the term an error points at highlighted.
+    let mut query_line = vec![Span::styled("> ", bold())];
+    match s.error.as_ref().filter(|e| e.start <= e.end && q.is_char_boundary(e.start.min(q.len())) && q.is_char_boundary(e.end.min(q.len()))) {
+        Some(e) => {
+            let (a, b) = (e.start.min(q.len()), e.end.min(q.len()));
+            query_line.push(Span::raw(q[..a].to_string()));
+            query_line.push(Span::styled(q[a..b].to_string(), fg(Color::Red).add_modifier(Modifier::UNDERLINED)));
+            query_line.push(Span::raw(q[b..].to_string()));
+        }
+        None => query_line.push(Span::raw(q.to_string())),
+    }
+    let mut lines = vec![Line::from(query_line)];
+
+    if focused {
+        let ctx = assist::context(q, s.input.cursor());
+        let hint = assist::hint(&ctx, q.trim().is_empty());
+        let head_style = if hint.warning { fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { fg(Color::Cyan).add_modifier(Modifier::BOLD) };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(hint.head.clone(), head_style),
+            Span::raw("  "),
+            Span::styled(hint.text.clone(), dim()),
+        ]));
+        // Completions (the cycle being stepped through, or what Tab would offer), else examples.
+        let (items, current) = match app.active_cycle() {
+            Some(c) => (c.items.clone(), Some(c.idx)),
+            None => (assist::candidates(&ctx, &app.vocab), None),
+        };
+        let mut l = vec![Span::raw("  ")];
+        if !items.is_empty() {
+            l.push(Span::styled("Tab ▸ ", dim()));
+            let mut used = 8;
+            for (i, c) in items.iter().enumerate() {
+                let w = c.display.chars().count() + 2;
+                if used + w + 12 > inner_w && i > 0 {
+                    l.push(Span::styled(format!("… +{} more", items.len() - i), dim()));
+                    break;
+                }
+                used += w;
+                let style = if Some(i) == current { selected() } else { fg(Color::Cyan) };
+                l.push(Span::styled(c.display.clone(), style));
+                l.push(Span::raw("  "));
+            }
+        } else if !hint.examples.is_empty() {
+            l.push(Span::styled("e.g. ", dim()));
+            for e in &hint.examples {
+                l.push(Span::raw(e.to_string()));
+                l.push(Span::raw("   "));
+            }
+        }
+        lines.push(Line::from(l));
+    }
+
     if let Some(e) = &s.error {
-        let q = s.input.text();
-        let start = q[..e.start.min(q.len())].chars().count();
-        let width = q[e.start.min(q.len())..e.end.min(q.len())].chars().count().max(1);
-        lines.push(Line::styled(format!("  {}{}", " ".repeat(start), "^".repeat(width)), fg(Color::Red)));
-        lines.push(Line::styled(format!("  {}", e.message), fg(Color::Red)));
+        lines.push(Line::styled(format!("  ✖ {}", e.message), fg(Color::Red)));
     } else if let Some(m) = &s.message {
         lines.push(Line::styled(format!("  {m}"), dim()));
-    } else if let Some(sum) = &s.summary {
+    } else if let Some(sum) = s.summary.as_ref().filter(|_| !q.trim().is_empty()) {
         let per: Vec<String> = sum.per_drive.iter().take(6).map(|d| format!("D{} {}", d.drive_id, format_count(d.files))).collect();
         lines.push(Line::styled(
             format!(
@@ -465,6 +530,8 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             dim(),
         ));
+    } else if !focused {
+        lines.push(Line::styled("  / or i to type a query · F1 lists every filter", dim()));
     }
     let title = format!(
         "Search  sort: {}{}",
@@ -476,13 +543,17 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
         },
         if s.descending { " ↓" } else { " ↑" }
     );
-    let b = block(title).border_style(if s.focused { fg(Color::Cyan) } else { Style::new() });
+    let b = block(title).border_style(if focused { fg(Color::Cyan) } else { Style::new() });
     f.render_widget(Paragraph::new(lines).block(b), input_area);
     app.hits.search_input = Some(input_area);
     let s = &app.search;
-    if s.focused {
+    if focused {
         let x = input_area.x + 3 + s.input.cursor() as u16;
         f.set_cursor_position((x.min(input_area.right().saturating_sub(2)), input_area.y + 1));
+    }
+    if s.input.text().trim().is_empty() && s.hits.is_empty() {
+        draw_cheatsheet(f, app, results_area);
+        return;
     }
 
     let rows: Vec<Row> = s
@@ -513,6 +584,138 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
     let mut state = TableState::default().with_selected((n > 0).then_some(s.sel));
     f.render_stateful_widget(table, results_area, &mut state);
     app.hits.list = Some(ListHit { kind: ListKind::Results, area: rows_area(results_area, true), offset: state.offset() });
+}
+
+/// Filter groups in reference order.
+fn filter_groups() -> Vec<&'static str> {
+    let mut groups: Vec<&'static str> = Vec::new();
+    for d in di_core::filters::FILTERS {
+        if !groups.contains(&d.group) {
+            groups.push(d.group);
+        }
+    }
+    groups
+}
+
+/// `label` then `items` separated by two spaces, wrapped to `width` with the
+/// continuation lines indented under the first item.
+fn labeled_wrap(label: &str, items: &[String], label_w: usize, width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut cur: Vec<Span> = vec![Span::styled(format!("  {label:<label_w$}"), dim())];
+    let mut used = label_w + 2;
+    for (i, it) in items.iter().enumerate() {
+        let w = it.chars().count() + 2;
+        if i > 0 && used + w > width {
+            out.push(Line::from(std::mem::take(&mut cur)));
+            cur.push(Span::raw(" ".repeat(label_w + 2)));
+            used = label_w + 2;
+        }
+        cur.push(Span::raw(format!("{it}  ")));
+        used += w;
+    }
+    out.push(Line::from(cur));
+    out
+}
+
+/// Shown instead of results while the query is empty.
+fn draw_cheatsheet(f: &mut Frame, app: &mut App, area: Rect) {
+    use di_core::filters::{EXAMPLES, FILTERS, TIPS};
+    let label_w = 16;
+    let width = area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = vec![Line::styled("Examples (click one to run it)", bold())];
+    let example_top = area.y + 2;
+    for (i, (q, what)) in EXAMPLES.iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{q:<38}"), fg(Color::Cyan)),
+            Span::styled(what.to_string(), dim()),
+        ]));
+        app.hits.examples.push((example_top + i as u16, q));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("Filters", bold()),
+        Span::styled("   Tab completes keys and values · F1 shows each with examples", dim()),
+    ]));
+    for g in filter_groups() {
+        let keys: Vec<String> =
+            FILTERS.iter().filter(|d| d.group == g).map(|d| if d.key.is_empty() { "word".into() } else { format!("{}:", d.key) }).collect();
+        lines.extend(labeled_wrap(g, &keys, label_w, width));
+    }
+    let v = &app.vocab;
+    if !v.collections.is_empty() || !v.categories.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("In this catalog", bold()));
+        if !v.collections.is_empty() {
+            let c: Vec<String> = v.collections.iter().map(|(s, _)| format!("in:{s}")).collect();
+            lines.extend(labeled_wrap("Collections", &c, label_w, width));
+        }
+        if !v.categories.is_empty() {
+            let c: Vec<String> = v.categories.iter().map(|s| format!("type:{s}")).collect();
+            lines.extend(labeled_wrap("Categories", &c, label_w, width));
+        }
+        if !v.drives.is_empty() {
+            let c: Vec<String> = v
+                .drives
+                .iter()
+                .take(12)
+                .map(|(id, l)| format!("drive:D{id}{}", l.as_deref().map(|l| format!(" ({l})")).unwrap_or_default()))
+                .collect();
+            lines.extend(labeled_wrap("Drives", &c, label_w, width));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("Tips", bold()));
+    for t in TIPS {
+        lines.push(Line::styled(format!("  {t}"), dim()));
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block("Search help")), area);
+}
+
+/// The full filter reference (F1): a table, and the selected filter in full below it.
+fn draw_filters_modal(f: &mut Frame, app: &mut App, sel: usize) {
+    use di_core::filters::FILTERS;
+    let area = f.area();
+    let r = centered(area, 120, area.height.saturating_sub(2));
+    f.render_widget(Clear, r);
+    app.hits.modal = Some(r);
+    let sel = sel.min(FILTERS.len() - 1);
+    let [table_area, detail_area] = Layout::vertical([Constraint::Min(5), Constraint::Length(6)]).areas(r);
+
+    let mut rows: Vec<Row> = Vec::new();
+    let mut row_of: Vec<usize> = vec![0; FILTERS.len()];
+    let mut filter_at: Vec<Option<usize>> = Vec::new();
+    for g in filter_groups() {
+        rows.push(Row::new(vec![Cell::from(Span::styled(g, bold()))]));
+        filter_at.push(None);
+        for (i, d) in FILTERS.iter().enumerate().filter(|(_, d)| d.group == g) {
+            row_of[i] = rows.len();
+            filter_at.push(Some(i));
+            let name = if d.key.is_empty() { "word".to_string() } else { format!("{}:", d.key) };
+            rows.push(Row::new(vec![Cell::from(format!("  {name}")).style(fg(Color::Cyan)), Cell::from(d.help)]));
+        }
+    }
+    let title = "Search filters — ↑↓ or a letter to move · ⏎ adds it to the query · esc closes";
+    let table = Table::new(rows, [Constraint::Length(14), Constraint::Min(30)]).row_highlight_style(selected()).block(block(title));
+    let mut state = TableState::default().with_selected(Some(row_of[sel]));
+    f.render_stateful_widget(table, table_area, &mut state);
+    let body = rows_area(table_area, false);
+    for y in 0..body.height {
+        if let Some(Some(i)) = filter_at.get(state.offset() + y as usize) {
+            app.hits.filter_rows.push((body.y + y, *i));
+        }
+    }
+
+    let d = &FILTERS[sel];
+    let detail = vec![
+        Line::from(vec![Span::styled(d.syntax, bold()), Span::raw("   "), Span::styled(d.help, dim())]),
+        Line::from(vec![
+            Span::styled("e.g.  ", dim()),
+            Span::styled(d.examples.join("    "), fg(Color::Cyan)),
+        ]),
+        Line::styled(di_core::filters::TIPS.join("  "), dim()),
+    ];
+    f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: true }).block(block(if d.key.is_empty() { "word".to_string() } else { format!("{}:", d.key) })), detail_area);
 }
 
 // -------------------------------------------------------------------------------------
@@ -596,6 +799,296 @@ fn draw_browse(f: &mut Frame, app: &mut App, area: Rect) {
 fn rows_area(area: Rect, header: bool) -> Rect {
     let top = 1 + header as u16;
     Rect { x: area.x + 1, y: area.y + top, width: area.width.saturating_sub(2), height: area.height.saturating_sub(top + 1) }
+}
+
+// -------------------------------------------------------------------------------------
+// Duplicates
+// -------------------------------------------------------------------------------------
+
+fn confidence_text(c: di_core::dupes::Confidence) -> &'static str {
+    use di_core::dupes::Confidence;
+    match c {
+        Confidence::Exact => "exact: same full BLAKE3 hash (verified)",
+        Confidence::Likely => "likely: same size and quick hash (first and last 64 KiB)",
+        Confidence::Probable => "probable: same name and size, content unknown",
+    }
+}
+
+fn drive_list(ids: &[i64]) -> String {
+    let mut v: Vec<String> = ids.iter().take(6).map(|d| format!("D{d}")).collect();
+    if ids.len() > 6 {
+        v.push(format!("+{}", ids.len() - 6));
+    }
+    v.join(" ")
+}
+
+fn draw_dupes(f: &mut Frame, app: &mut App, area: Rect) {
+    use di_core::dupes::Confidence;
+    let [head_area, groups_area, members_area] =
+        Layout::vertical([Constraint::Length(5), Constraint::Min(6), Constraint::Percentage(35)]).areas(area);
+    let d = &app.dupes;
+
+    // Settings and totals.
+    let mut levels: Vec<Span> = vec![Span::styled("c ", dim())];
+    for c in [Confidence::Exact, Confidence::Likely, Confidence::Probable] {
+        let style = if c == d.confidence { selected().add_modifier(Modifier::BOLD) } else { dim() };
+        levels.push(Span::styled(format!(" {} ", c.as_str()), style));
+        levels.push(Span::raw(" "));
+    }
+    levels.push(Span::styled(format!("  {}", confidence_text(d.confidence)), dim()));
+    let scope = match &d.editing {
+        Some(e) => Line::from(vec![Span::styled("f scope: ", dim()), Span::raw(e.text().to_string())]),
+        None => Line::from(vec![
+            Span::styled("m ", dim()),
+            Span::raw(format!("≥ {}", if d.min_size == 0 { "any size".into() } else { format_size(d.min_size) })),
+            Span::styled("   x ", dim()),
+            Span::raw(if d.same_drive_only { "copies on one drive only" } else { "all copies" }),
+            Span::styled("   f ", dim()),
+            Span::raw(if d.filter.is_empty() { "all files".to_string() } else { d.filter.clone() }),
+        ]),
+    };
+    let totals = if let Some(e) = &d.error {
+        Line::styled(format!("✖ {e}"), fg(Color::Red))
+    } else {
+        match (&d.summary, d.running) {
+            (_, true) => Line::styled("Looking for duplicates…", dim()),
+            (Some(s), _) => Line::from(vec![
+                Span::styled(format!("{} groups", format_count(s.groups)), bold()),
+                Span::raw(format!(" · {} files · ", format_count(s.files))),
+                Span::styled(format_size(s.wasted), fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw(" in extra copies"),
+                Span::styled(
+                    if (s.groups as usize) > d.groups.len() { format!("  (largest {} shown)", format_count(d.groups.len() as u64)) } else { String::new() },
+                    dim(),
+                ),
+            ]),
+            (None, _) => Line::raw(""),
+        }
+    };
+    let b = block("Duplicates").border_style(if d.editing.is_some() { fg(Color::Cyan) } else { Style::new() });
+    f.render_widget(Paragraph::new(vec![Line::from(levels), scope, totals]).block(b), head_area);
+    if let Some(e) = &d.editing {
+        f.set_cursor_position((head_area.x + 10 + e.cursor() as u16, head_area.y + 2));
+    }
+
+    // Groups.
+    if d.groups.is_empty() && !d.running && d.error.is_none() {
+        let text = match d.confidence {
+            Confidence::Exact => "No verified duplicates yet. Exact duplicates need full hashes: connect a drive and press v on \
+                                  the Drives screen (or run `drive-index scan --verify`). Press c for likely duplicates.",
+            Confidence::Likely => "No duplicates by quick hash. Quick hashes are made in the content phase for files of 1 MiB or more \
+                                   whose size matches another file. Press m for a lower minimum size, or c for probable duplicates.",
+            Confidence::Probable => "No files share a name and size at this minimum size. Press m to change it.",
+        };
+        f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }).block(block("Groups")), groups_area);
+        f.render_widget(Paragraph::new("").block(block("Copies")), members_area);
+        return;
+    }
+    let rows: Vec<Row> = d
+        .groups
+        .iter()
+        .map(|g| {
+            Row::new(vec![
+                Cell::from(Line::from(format_size(g.size)).alignment(Alignment::Right)),
+                Cell::from(Line::from(g.copies.to_string()).alignment(Alignment::Right)),
+                Cell::from(Line::from(format_size(g.wasted)).alignment(Alignment::Right)),
+                Cell::from(drive_list(&g.drives)),
+                Cell::from(g.name.clone()),
+            ])
+        })
+        .collect();
+    let n = rows.len();
+    let table = Table::new(rows, [Constraint::Length(10), Constraint::Length(7), Constraint::Length(10), Constraint::Length(22), Constraint::Min(20)])
+        .header(Row::new(vec![
+            Cell::from(Line::from("Size").alignment(Alignment::Right)),
+            Cell::from(Line::from("Copies").alignment(Alignment::Right)),
+            Cell::from(Line::from("Extra").alignment(Alignment::Right)),
+            Cell::from("Drives"),
+            Cell::from("Name"),
+        ]).style(dim()))
+        .row_highlight_style(if d.focus_members { Style::new().add_modifier(Modifier::BOLD) } else { selected() })
+        .block(block(format!("Groups ({})", format_count(n as u64))));
+    let mut state = TableState::default().with_selected((n > 0).then_some(d.sel));
+    f.render_stateful_widget(table, groups_area, &mut state);
+    app.hits.list = Some(ListHit { kind: ListKind::DupeGroups, area: rows_area(groups_area, true), offset: state.offset() });
+
+    // Members of the selected group.
+    let d = &app.dupes;
+    let rows: Vec<Row> = d
+        .members
+        .iter()
+        .map(|m| {
+            Row::new(vec![
+                Cell::from(format!("D{} {}", m.drive_id, clip(m.drive_label.as_deref().unwrap_or(""), 14))),
+                Cell::from(m.path.clone()),
+                Cell::from(local_ns(m.mtime_ns)),
+            ])
+        })
+        .collect();
+    let title = match d.groups.get(d.sel) {
+        Some(g) => format!("Copies of {} ({} each)", clip(&g.name, 60), format_size(g.size)),
+        None => "Copies".into(),
+    };
+    let m = rows.len();
+    let table = Table::new(rows, [Constraint::Length(18), Constraint::Min(20), Constraint::Length(16)])
+        .row_highlight_style(if d.focus_members { selected() } else { Style::new() })
+        .block(block(title).border_style(if d.focus_members { fg(Color::Cyan) } else { Style::new() }));
+    let mut state = TableState::default().with_selected((m > 0).then_some(d.member_sel));
+    f.render_stateful_widget(table, members_area, &mut state);
+    if d.focus_members || app.hits.list.is_none() {
+        app.hits.list = Some(ListHit { kind: ListKind::DupeMembers, area: rows_area(members_area, false), offset: state.offset() });
+    }
+}
+
+// -------------------------------------------------------------------------------------
+// Collections
+// -------------------------------------------------------------------------------------
+
+fn bar(frac: f64, width: usize) -> String {
+    let frac = frac.clamp(0.0, 1.0);
+    let eighths = (frac * width as f64 * 8.0).round() as usize;
+    let mut s = "█".repeat(eighths / 8);
+    if eighths % 8 > 0 {
+        s.push(['▏', '▎', '▍', '▌', '▋', '▊', '▉'][eighths % 8 - 1]);
+    }
+    let used = s.chars().count();
+    s.push_str(&"·".repeat(width.saturating_sub(used)));
+    s
+}
+
+fn draw_collections(f: &mut Frame, app: &mut App, area: Rect) {
+    let c = &app.collections;
+    let [tabs_area, summary_area, drives_area, years_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(6), Constraint::Min(5), Constraint::Length(8)]).areas(area);
+
+    let mut tabs: Vec<Span> = vec![Span::styled(" ← ", dim())];
+    for (i, col) in c.list.iter().enumerate() {
+        let style = if i == c.sel { selected().add_modifier(Modifier::BOLD) } else { Style::new() };
+        tabs.push(Span::styled(format!(" {} ", col.name), style));
+        tabs.push(Span::raw(" "));
+    }
+    tabs.push(Span::styled(" →", dim()));
+    f.render_widget(Line::from(tabs), tabs_area);
+
+    let Some(cov) = c.coverage.as_ref().filter(|v| c.list.get(c.sel).is_some_and(|l| l.slug == v.collection.slug)) else {
+        let text = match (&c.error, c.running, c.list.is_empty()) {
+            (Some(e), _, _) => format!("✖ {e}"),
+            (None, true, _) => "Working out coverage…".into(),
+            (None, false, true) => "No collections in the catalog.".into(),
+            _ => String::new(),
+        };
+        f.render_widget(Paragraph::new(text).block(block("Coverage")), summary_area);
+        return;
+    };
+
+    let total = cov.items.max(1) as f64;
+    let hashed_pct = 100.0 * cov.hashed_items as f64 / total;
+    let labels = ["1 copy", "2 copies", "3+ copies"];
+    let styles = [fg(Color::Red), fg(Color::Yellow), fg(Color::Green)];
+    let bar_w = (summary_area.width as usize).saturating_sub(60).clamp(10, 40);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("{} items", format_count(cov.items)), bold()),
+        Span::raw(format!(" · {} · ", format_size(cov.bytes))),
+        Span::styled(
+            format!(
+                "{}{}",
+                if cov.hashed_items >= cov.items {
+                    "all identified by content hash".to_string()
+                } else {
+                    format!("{hashed_pct:.0}% identified by content hash, the rest by name and size")
+                },
+                if c.running { "  (updating…)" } else { "" }
+            ),
+            dim(),
+        ),
+    ])];
+    for i in 0..3 {
+        let n = cov.redundancy[i];
+        let mut l = vec![
+            Span::raw(format!("{:<10}", labels[i])),
+            Span::styled(bar(n as f64 / total, bar_w), styles[i]),
+            Span::raw(format!(" {:>9} ({:>3.0}%)", format_count(n), 100.0 * n as f64 / total)),
+        ];
+        if i == 0 && n > 0 {
+            l.push(Span::styled(format!("  {} on a single drive (a lists them)", format_size(cov.only_bytes)), fg(Color::Red)));
+        }
+        lines.push(Line::from(l));
+    }
+    let title = format!("{} — in:{} ({})", cov.collection.name, cov.collection.slug, cov.collection.query);
+    f.render_widget(Paragraph::new(lines).block(block(title)), summary_area);
+
+    // Per drive.
+    let share_w = 20;
+    let rows: Vec<Row> = cov
+        .drives
+        .iter()
+        .map(|d| {
+            let smart = match d.smart_passed {
+                Some(true) => Span::styled("ok", fg(Color::Green)),
+                Some(false) => Span::styled("FAILING", fg(Color::Red).add_modifier(Modifier::BOLD)),
+                None => Span::styled("-", dim()),
+            };
+            Row::new(vec![
+                Cell::from(format!("D{} {}", d.drive_id, clip(d.label.as_deref().unwrap_or(""), 16))),
+                Cell::from(Line::from(format_count(d.items)).alignment(Alignment::Right)),
+                Cell::from(Line::from(vec![Span::styled(bar(d.pct / 100.0, share_w), fg(Color::Cyan)), Span::raw(format!(" {:>3.0}%", d.pct))])),
+                Cell::from(Line::from(format_size(d.bytes)).alignment(Alignment::Right)),
+                Cell::from(Line::from(if d.only_items > 0 { format!("{} ({})", format_count(d.only_items), format_size(d.only_bytes)) } else { "-".into() }).alignment(Alignment::Right)),
+                Cell::from(Line::from(ago(Some(d.last_seen_at))).alignment(Alignment::Right)),
+                Cell::from(smart),
+            ])
+        })
+        .collect();
+    let n = rows.len();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(20),
+            Constraint::Length(10),
+            Constraint::Length(share_w as u16 + 6),
+            Constraint::Length(10),
+            Constraint::Length(22),
+            Constraint::Length(9),
+            Constraint::Length(8),
+        ],
+    )
+    .header(Row::new(vec![
+        Cell::from("Drive"),
+        Cell::from(Line::from("Items").alignment(Alignment::Right)),
+        Cell::from("Share of the collection"),
+        Cell::from(Line::from("Size").alignment(Alignment::Right)),
+        Cell::from(Line::from("Only on this drive").alignment(Alignment::Right)),
+        Cell::from(Line::from("Seen").alignment(Alignment::Right)),
+        Cell::from("SMART"),
+    ]).style(dim()))
+    .row_highlight_style(selected())
+    .block(block(format!("Drives ({n})")));
+    let mut state = TableState::default().with_selected((n > 0).then_some(c.drive_sel));
+    f.render_stateful_widget(table, drives_area, &mut state);
+    app.hits.list = Some(ListHit { kind: ListKind::CoverageDrives, area: rows_area(drives_area, true), offset: state.offset() });
+
+    // Items per year (capture year when known).
+    let cov = app.collections.coverage.as_ref().unwrap();
+    let inner = years_area.width.saturating_sub(2) as usize;
+    let years: Vec<&(i32, u64)> = cov.years.iter().rev().take((inner / 5).max(1)).collect::<Vec<_>>().into_iter().rev().collect();
+    let max = years.iter().map(|(_, n)| *n).max().unwrap_or(1).max(1) as f64;
+    let rows_h = years_area.height.saturating_sub(3) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    for level in (1..=rows_h).rev() {
+        let mut l = String::new();
+        for (_, n) in &years {
+            let h = *n as f64 / max * rows_h as f64;
+            let cell = if h >= level as f64 { "███" } else if h > (level - 1) as f64 && h > 0.0 { "▄▄▄" } else { "   " };
+            l.push_str(&format!(" {cell} "));
+        }
+        lines.push(Line::styled(l, fg(Color::Cyan)));
+    }
+    lines.push(Line::styled(years.iter().map(|(y, _)| format!(" {:>3} ", format!("'{:02}", y.rem_euclid(100)))).collect::<String>(), dim()));
+    let span = match (years.first(), years.last()) {
+        (Some((a, _)), Some((b, _))) => format!("Items per year ({a}–{b}; capture date, else modified)"),
+        _ => "Items per year".into(),
+    };
+    f.render_widget(Paragraph::new(lines).block(block(span)), years_area);
 }
 
 // -------------------------------------------------------------------------------------
@@ -684,6 +1177,9 @@ fn draw_setup(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_modal(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    if let Some(Modal::Filters { sel }) = app.modal {
+        return draw_filters_modal(f, app, sel);
+    }
     let Some(modal) = app.modal.take() else { return };
     draw_modal_inner(f, app, area, &modal);
     app.modal = Some(modal);
@@ -699,9 +1195,13 @@ fn draw_modal_inner(f: &mut Frame, app: &mut App, area: Rect, modal: &Modal) {
                 Line::styled("Drives", bold()),
                 Line::raw("  s scan the selected (connected) drive   p pause/resume   x stop (resumes later)"),
                 Line::raw("  u unmount   e eject   l label   n notes   b/⏎ browse its files"),
+                Line::raw("  v rescan and read likely duplicates in full, making them exact (verified)"),
+                Line::styled("Duplicates and Collections", bold()),
+                Line::raw("  c confidence  m min size  x same drive  f scope · ←/→ collection  a at-risk files"),
                 Line::styled("Search", bold()),
-                Line::raw("  type a query: ext:cr2,crw  date:2014-06..2014-09  size:>10M  drive:D3  path:DCIM"),
-                Line::raw("  -term negates; type:photo_raw  in:photos-raw  trash:yes  hidden:no"),
+                Line::raw("  type a query: ext:cr2,crw  date:2014-06..2014-09  size:>10M  drive:D3  camera:canon"),
+                Line::raw("  -term negates; commas mean OR; Tab completes filter names and values"),
+                Line::raw("  F1 lists every filter with examples (⏎ there adds one to the query)"),
                 Line::raw("  ⏎ details   s sort   d reverse   c copy path   b browse to the file"),
                 Line::styled("Browse", bold()),
                 Line::raw("  ⏎/→ open   ←/⌫ up   s sort by size/count/name/modified"),
@@ -709,7 +1209,7 @@ fn draw_modal_inner(f: &mut Frame, app: &mut App, area: Rect, modal: &Modal) {
                 Line::styled("Esc closes this help.", dim()),
             ],
             86,
-            17,
+            21,
         ),
         Modal::ConfirmQuit => (
             "Quit?".into(),
@@ -758,6 +1258,7 @@ fn draw_modal_inner(f: &mut Frame, app: &mut App, area: Rect, modal: &Modal) {
             lines.push(Line::styled("↑↓ choose   ⏎ scan as that drive   esc not now", dim()));
             ("Which drive is this?".into(), lines, 70, candidates.len() as u16 + 9)
         }
+        Modal::Filters { .. } => unreachable!("drawn by draw_filters_modal"),
         Modal::File(d) => {
             let opt = |v: Option<i64>| v.map(|x| x.to_string()).unwrap_or_else(|| "-".into());
             let lines = vec![
