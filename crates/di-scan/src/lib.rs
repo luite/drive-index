@@ -1,5 +1,6 @@
 //! Scan pipeline: walker → staging DB → aggregates → merge into the catalog.
 
+pub mod controller;
 pub mod device;
 pub mod merge;
 pub mod run;

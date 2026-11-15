@@ -10,18 +10,7 @@ use di_core::catalog::{DriveSummary, FsSummary, ScanSummary};
 use di_core::search::{Hit, Summary};
 use di_model::units::{format_count, format_size};
 
-pub fn format_duration(d: Duration) -> String {
-    let s = d.as_secs_f64();
-    if s < 1.0 {
-        format!("{:.0} ms", s * 1000.0)
-    } else if s < 60.0 {
-        format!("{s:.1} s")
-    } else if s < 3600.0 {
-        format!("{}m {:02}s", s as u64 / 60, s as u64 % 60)
-    } else {
-        format!("{}h {:02}m", s as u64 / 3600, (s as u64 % 3600) / 60)
-    }
-}
+pub use di_model::units::format_duration;
 
 fn local_ns(ns: Option<i64>) -> String {
     ns.and_then(|ns| Timestamp::from_nanosecond(ns as i128).ok())

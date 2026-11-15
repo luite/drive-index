@@ -5,6 +5,7 @@ pub mod drives;
 pub mod query;
 pub mod search;
 pub mod sessions;
+pub mod views;
 mod seed;
 
 pub use catalog::{Catalog, DirSource, FsUsage, NewScan, SourceIds, now_secs};

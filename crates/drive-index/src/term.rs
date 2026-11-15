@@ -47,6 +47,11 @@ pub struct Term {
 
 impl Term {
     pub fn start(quiet: bool) -> Result<Term> {
+        Term::start_shared(quiet, Arc::new(Progress::default()), Arc::new(PhaseCell::default()))
+    }
+
+    /// Like `start`, but showing progress counters owned by someone else (the controller).
+    pub fn start_shared(quiet: bool, progress: Arc<Progress>, phase: Arc<PhaseCell>) -> Result<Term> {
         let show = !quiet && std::io::stderr().is_terminal();
         let current = Arc::new(Mutex::new(Arc::new(Control::default())));
         let interrupted = Arc::new(AtomicBool::new(false));
@@ -64,8 +69,6 @@ impl Term {
             })
             .context("installing Ctrl-C handler")?;
         }
-        let progress = Arc::new(Progress::default());
-        let phase = Arc::new(PhaseCell::default());
         let printer = Printer { lock: Arc::new(Mutex::new(())), show_progress: show };
         let stop = Arc::new(AtomicBool::new(false));
         let reporter = show.then(|| {
@@ -79,16 +82,6 @@ impl Term {
     /// The control of the current operation (cancelled by Ctrl-C).
     pub fn control(&self) -> Arc<Control> {
         self.current.lock().unwrap().clone()
-    }
-
-    /// Start a new cancellable operation; Ctrl-C now cancels this one.
-    pub fn new_control(&self) -> Arc<Control> {
-        let c = Arc::new(Control::default());
-        if self.interrupted() {
-            c.cancel();
-        }
-        *self.current.lock().unwrap() = c.clone();
-        c
     }
 
     pub fn interrupted(&self) -> bool {

@@ -1,30 +1,19 @@
-//! `drive-index watch`: react to drives being connected (PLAN.md §2.1–2.2, headless).
+//! `drive-index watch`: headless front end of the drive controller.
 
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 
-use di_core::Catalog;
-use di_core::drives::DriveMatch;
 use di_model::units::format_size;
-use di_platform::{Bus, DeviceEvent, DriveProbe};
-use di_scan::ResumeMode;
-use di_scan::device::{After, DeviceReport, DeviceScanRequest, IdentityChoice, Step, record_drive, to_record};
-use di_walk::{Control, WalkConfig};
+use di_platform::DriveProbe;
+use di_scan::controller::{Controller, ControllerOptions, Event, NewDrivePolicy, Outcome, Policy, Question};
+use di_scan::device::{After, report_lines};
+use di_walk::WalkConfig;
 
-use crate::scan_cmd::{step_printer, summarize};
-use crate::term::Term;
-
-/// Wait this long after the last event for a disk before acting (partitions and
-/// volumes appear as separate events).
-const SETTLE: Duration = Duration::from_millis(1500);
+use crate::term::{Printer, Term};
 
 pub struct WatchOptions {
     pub catalog_path: PathBuf,
@@ -54,22 +43,81 @@ pub fn parse_age(s: &str) -> Result<i64> {
     Ok(n * mult)
 }
 
-struct Active {
-    disk: String,
-    control: Arc<Control>,
-    /// Set once the scan starts unmounting: disappear events are then our own doing.
-    releasing: Arc<AtomicBool>,
-    handle: JoinHandle<Result<DeviceReport>>,
+pub fn humanize_age(secs: i64) -> String {
+    match secs {
+        s if s < 120 => format!("{s}s"),
+        s if s < 7200 => format!("{}m", s / 60),
+        s if s < 2 * 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
 }
 
-enum Decision {
-    Scan,
-    Skip,
+pub fn describe_probe(p: &DriveProbe) -> String {
+    format!("{} ({} {}, {})", p.dev_path, p.model.as_deref().unwrap_or("drive"), format_size(p.capacity_bytes), p.bus.as_str())
+}
+
+fn print_event(printer: &Printer, ev: Event) {
+    match ev {
+        Event::Log { text, .. } => printer.say(text),
+        Event::Attached { probe, drive_id, label, outcome, .. } => {
+            let desc = describe_probe(&probe);
+            let who = match (drive_id, label) {
+                (Some(id), Some(l)) => format!("D{id} \"{l}\""),
+                (Some(id), None) => format!("D{id} (unlabeled)"),
+                _ => "New drive".into(),
+            };
+            let now = di_core::now_secs();
+            match outcome {
+                Outcome::Queued => printer.say(format!("{who} connected: {desc}; scanning.")),
+                Outcome::UpToDate { last_scan } => printer.say(format!(
+                    "{who} connected: {desc}; up to date (last scan {} ago).",
+                    humanize_age(now - last_scan)
+                )),
+                Outcome::Reported => printer.say(format!(
+                    "New drive {desc} is not in the catalog. Scan it with `drive-index scan {}`, or watch with --scan-new.",
+                    probe.dev_path
+                )),
+                Outcome::Ask(Question::Ambiguous(c)) => {
+                    let ids: Vec<String> = c.iter().map(|(d, _)| format!("D{d}")).collect();
+                    printer.say(format!(
+                        "{desc} could be {}; scan it manually with --same-as D<n> or --new-drive.",
+                        ids.join(" or ")
+                    ))
+                }
+                Outcome::Ask(Question::NewDrive) => printer.say(format!("New drive {desc}.")),
+                Outcome::Ignored(_) => {}
+            }
+        }
+        Event::Detached { disk, expected } => {
+            if !expected {
+                printer.say(format!("/dev/{disk} disconnected."))
+            }
+        }
+        Event::JobStarted { .. } => {}
+        Event::JobStep { text, .. } => printer.say(text),
+        Event::JobFinished { disk, result } => match result {
+            Ok(report) => {
+                for line in report_lines(&report) {
+                    printer.say(line);
+                }
+            }
+            Err(e) => printer.say(format!("/dev/{disk}: scan failed: {e}")),
+        },
+    }
 }
 
 pub fn run(opts: &WatchOptions) -> Result<ExitCode> {
-    let term = Term::start(opts.quiet)?;
-    let rx = di_platform::watch()?;
+    let ctl = Controller::start(ControllerOptions {
+        catalog_path: opts.catalog_path.clone(),
+        policy: Policy {
+            new_drive: if opts.scan_new { NewDrivePolicy::Scan } else { NewDrivePolicy::Report },
+            rescan_after_secs: opts.rescan_after_secs,
+            after: opts.after,
+            include_images: opts.include_images,
+        },
+        walk: opts.walk.clone(),
+    })?;
+    let term = Term::start_shared(opts.quiet, ctl.progress.clone(), ctl.phase.clone())?;
     term.say(format!(
         "Watching for drives (new drives: {}; rescan known drives after {}; then {}). Ctrl-C to stop.",
         if opts.scan_new { "scan" } else { "report only" },
@@ -80,210 +128,21 @@ pub fn run(opts: &WatchOptions) -> Result<ExitCode> {
             After::KeepMounted => "keep mounted",
         }
     ));
-
-    let mut pending: HashMap<String, Instant> = HashMap::new();
-    let mut handled: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<String> = VecDeque::new();
-    let mut active: Option<Active> = None;
-    // Disks we unmounted/ejected ourselves: their disappear events are expected.
-    let mut released: HashSet<String> = HashSet::new();
-
-    loop {
-        if term.interrupted() && active.is_none() {
-            break;
-        }
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(DeviceEvent::Appeared(d)) => {
-                released.remove(&d);
-                pending.insert(d, Instant::now());
-            }
-            Ok(DeviceEvent::Disappeared(d)) => {
-                pending.remove(&d);
-                queue.retain(|q| *q != d);
-                let was_handled = handled.remove(&d);
-                match active.as_ref().filter(|a| a.disk == d) {
-                    Some(a) if a.releasing.load(Ordering::SeqCst) => {
-                        released.insert(d);
-                    }
-                    Some(a) => {
-                        if !a.control.is_cancelled() {
-                            a.control.cancel();
-                            term.say(format!("/dev/{d} was removed during the scan; it will resume next time."));
-                        }
-                    }
-                    None if was_handled && !released.contains(&d) => {
-                        term.say(format!("/dev/{d} disconnected."));
-                    }
-                    None => {}
-                }
-            }
+    while !term.interrupted() {
+        match ctl.events.recv_timeout(Duration::from_millis(200)) {
+            Ok(ev) => print_event(&term.printer, ev),
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => bail!("device watcher stopped"),
+            Err(RecvTimeoutError::Disconnected) => break,
         }
-
-        // Disks whose events have settled.
-        let ready: Vec<String> =
-            pending.iter().filter(|(_, t)| t.elapsed() >= SETTLE).map(|(d, _)| d.clone()).collect();
-        for d in ready {
-            pending.remove(&d);
-            if term.interrupted() {
-                continue;
-            }
-            // Partitions and APFS containers resolve to their physical disk; handle each once.
-            let Ok(id) = di_platform::resolve_whole(&d) else { continue };
-            if handled.contains(&id) || queue.contains(&id) || active.as_ref().is_some_and(|a| a.disk == id) {
-                continue;
-            }
-            handled.insert(id.clone());
-            let Ok(probe) = di_platform::probe(&id) else { continue };
-            if let Decision::Scan = decide(opts, &term, &probe) {
-                queue.push_back(id);
-            }
-        }
-
-        // A finished scan.
-        if active.as_ref().is_some_and(|a| a.handle.is_finished()) {
-            let a = active.take().unwrap();
-            match a.handle.join() {
-                Ok(Ok(report)) => {
-                    if report.unmounted {
-                        released.insert(a.disk.clone());
-                    }
-                    summarize(&term.printer, &report)
-                }
-                Ok(Err(e)) => term.say(format!("/dev/{}: scan failed: {e:#}", a.disk)),
-                Err(_) => term.say(format!("/dev/{}: scan thread panicked", a.disk)),
-            }
-        }
-
-        // Start the next one.
-        if active.is_none() && !term.interrupted() {
-            if let Some(disk) = queue.pop_front() {
-                let control = term.new_control();
-                let req = DeviceScanRequest {
-                    catalog_path: opts.catalog_path.clone(),
-                    dev: disk.clone(),
-                    label: None,
-                    walk: opts.walk.clone(),
-                    resume: ResumeMode::Auto,
-                    after: opts.after,
-                    identity: IdentityChoice::Auto,
-                    allow_internal: false,
-                };
-                let (progress, phase, printer) = (term.progress.clone(), term.phase.clone(), term.printer.clone());
-                let c = control.clone();
-                let threads = opts.walk.threads;
-                let releasing = Arc::new(AtomicBool::new(false));
-                let rel = releasing.clone();
-                let handle = std::thread::spawn(move || {
-                    let mut print = step_printer(printer, threads);
-                    let mut on_step = |step: Step| {
-                        if matches!(step, Step::Unmounting | Step::Ejecting) {
-                            rel.store(true, Ordering::SeqCst);
-                        }
-                        print(step)
-                    };
-                    di_scan::device::scan_device(&req, &c, &progress, &phase, &mut on_step)
-                });
-                active = Some(Active { disk, control, releasing, handle });
-            }
-        }
+    }
+    // Stop: a running scan is interrupted (resumable); show its last messages.
+    if ctl.job().is_some() {
+        term.say("Stopping the running scan (it resumes next time)…");
+    }
+    for ev in ctl.shutdown() {
+        print_event(&term.printer, ev);
     }
     term.say("Stopped watching.");
     term.finish();
     Ok(ExitCode::SUCCESS)
-}
-
-fn decide(opts: &WatchOptions, term: &Term, probe: &DriveProbe) -> Decision {
-    if !probe.is_external() || (probe.bus == Bus::Image && !opts.include_images) {
-        return Decision::Skip;
-    }
-    let desc = format!(
-        "{} ({} {}, {})",
-        probe.dev_path,
-        probe.model.as_deref().unwrap_or("drive"),
-        format_size(probe.capacity_bytes),
-        probe.bus.as_str()
-    );
-    let mut catalog = match Catalog::open(&opts.catalog_path) {
-        Ok(c) => c,
-        Err(e) => {
-            term.say(format!("{desc}: cannot open catalog: {e:#}"));
-            return Decision::Skip;
-        }
-    };
-    match catalog.match_drive(&to_record(probe)) {
-        Ok(DriveMatch::New) if opts.scan_new => Decision::Scan,
-        Ok(DriveMatch::New) => {
-            term.say(format!(
-                "New drive {desc} is not in the catalog. Scan it with `drive-index scan {}`, or watch with --scan-new.",
-                probe.dev_path
-            ));
-            Decision::Skip
-        }
-        Ok(DriveMatch::Ambiguous(c)) => {
-            let ids: Vec<String> = c.iter().map(|(d, _)| format!("D{d}")).collect();
-            term.say(format!(
-                "{desc} could be {}; scan it manually with --same-as D<n> or --new-drive.",
-                ids.join(" or ")
-            ));
-            Decision::Skip
-        }
-        Ok(DriveMatch::Known { drive_id, .. }) => {
-            // Record the connection, then check how fresh each filesystem's scan is.
-            let fs_ids = match record_drive(&mut catalog, probe, IdentityChoice::SameAs(drive_id), None) {
-                Ok((_, _, _, ids)) => ids,
-                Err(e) => {
-                    term.say(format!("{desc}: {e:#}"));
-                    return Decision::Skip;
-                }
-            };
-            let now = di_core::now_secs();
-            let mut oldest: Option<i64> = None;
-            let mut stale = false;
-            for (vol, fs) in probe.volumes.iter().zip(fs_ids) {
-                if !vol.scannable() {
-                    continue;
-                }
-                match catalog.last_scanned(fs).ok().flatten() {
-                    Some(t) => {
-                        oldest = Some(oldest.map_or(t, |o: i64| o.min(t)));
-                        if now - t >= opts.rescan_after_secs {
-                            stale = true;
-                        }
-                    }
-                    None => stale = true,
-                }
-            }
-            let label = catalog
-                .drive_label(drive_id)
-                .ok()
-                .flatten()
-                .map(|l| format!("\"{l}\""))
-                .unwrap_or_else(|| "(unlabeled)".into());
-            if stale {
-                term.say(format!("D{drive_id} {label} connected: {desc}; scanning."));
-                Decision::Scan
-            } else {
-                term.say(format!(
-                    "D{drive_id} {label} connected: {desc}; up to date (last scan {} ago).",
-                    humanize_age(now - oldest.unwrap_or(now))
-                ));
-                Decision::Skip
-            }
-        }
-        Err(e) => {
-            term.say(format!("{desc}: {e:#}"));
-            Decision::Skip
-        }
-    }
-}
-
-fn humanize_age(secs: i64) -> String {
-    match secs {
-        s if s < 120 => format!("{s}s"),
-        s if s < 7200 => format!("{}m", s / 60),
-        s if s < 2 * 86_400 => format!("{}h", s / 3600),
-        s => format!("{}d", s / 86_400),
-    }
 }

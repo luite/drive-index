@@ -283,3 +283,93 @@ fn reset_progress(p: &Progress) {
     p.alloc_bytes.store(0, Relaxed);
     p.errors.store(0, Relaxed);
 }
+
+/// One-line summary of a finished filesystem scan.
+pub fn describe_outcome(out: &ScanOutcome, threads: usize) -> String {
+    use di_model::units::{format_count, format_duration, format_size};
+    let t = &out.totals;
+    let secs = out.walk_ms as f64 / 1000.0;
+    let rate = if secs > 0.0 { (t.files as f64 / secs) as u64 } else { 0 };
+    let mut s = format!(
+        "{} files, {} dirs, {} in {} ({}/s, {}, {} threads); merged in {}",
+        format_count(t.files),
+        format_count(t.dirs),
+        format_size(t.bytes),
+        format_duration(std::time::Duration::from_millis(out.walk_ms)),
+        format_count(rate),
+        out.method,
+        threads,
+        format_duration(std::time::Duration::from_millis(out.merge_ms)),
+    );
+    if let Some(done) = out.resumed_dirs {
+        s.push_str(&format!("; resumed scan #{} ({} dirs were already done)", out.scan_id, format_count(done)));
+    }
+    if t.errors > 0 {
+        s.push_str(&format!("; {} entries unreadable", t.errors));
+    }
+    s
+}
+
+/// Human text for a device-scan step (None for steps not worth a line).
+pub fn step_text(step: &Step, threads: usize) -> Option<String> {
+    use di_model::units::format_size;
+    Some(match step {
+        Step::Identified { drive_id, new, probe } => format!(
+            "{} {} — {} {} ({}){}",
+            probe.dev_path,
+            if *new { format!("new drive D{drive_id}") } else { format!("is D{drive_id}") },
+            probe.model.as_deref().unwrap_or("drive"),
+            format_size(probe.capacity_bytes),
+            probe.bus.as_str(),
+            if probe.volumes.is_empty() { ", no filesystems" } else { "" }
+        ),
+        Step::Mounting(v) if v.mount_point.is_none() => {
+            format!("  {} {} \"{}\": mounting read-only", v.dev, v.fs_type, v.label.as_deref().unwrap_or(""))
+        }
+        Step::Mounting(v) => format!(
+            "  {} {} \"{}\": already mounted{}",
+            v.dev,
+            v.fs_type,
+            v.label.as_deref().unwrap_or(""),
+            if v.mounted_writable == Some(true) { " READ-WRITE by the system (scanned as-is)" } else { " read-only" }
+        ),
+        Step::Scanned(v, out) => match out.status {
+            ScanStatus::Complete => format!("  {}: {}", v.dev, describe_outcome(out, threads)),
+            ScanStatus::Interrupted => format!("  {}: interrupted (resumes next time)", v.dev),
+        },
+        Step::Scanning { .. } | Step::Unmounting | Step::Ejecting => return None,
+    })
+}
+
+/// Closing lines for a device report: skipped/failed volumes and the final state.
+pub fn report_lines(r: &DeviceReport) -> Vec<String> {
+    let mut out = Vec::new();
+    for v in &r.volumes {
+        match &v.outcome {
+            VolumeOutcome::Skipped(reason) if !reason.is_empty() => {
+                out.push(format!("  {} {}: skipped — {reason}", v.dev, v.fs_type))
+            }
+            VolumeOutcome::Failed(e) => out.push(format!("  {} {}: FAILED — {e}", v.dev, v.fs_type)),
+            _ => {}
+        }
+    }
+    if r.weak_match {
+        out.push(format!(
+            "  note: recognised as D{} by weak identifiers only; if this is a different drive, rescan with --new-drive",
+            r.drive_id
+        ));
+    }
+    let dev = &r.dev_path;
+    out.push(if r.ejected {
+        format!("Ejected {dev} — safe to remove.")
+    } else if r.unmounted {
+        format!("Unmounted {dev}.")
+    } else if r.interrupted {
+        format!("{dev} left mounted read-only; the interrupted scan resumes when you scan it again.")
+    } else if r.volumes.iter().any(|v| matches!(v.outcome, VolumeOutcome::Failed(_))) {
+        format!("{dev} left mounted because a filesystem failed to scan.")
+    } else {
+        format!("{dev} left mounted read-only.")
+    });
+    out
+}

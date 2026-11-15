@@ -2,11 +2,13 @@
 //! default command; until then running without a subcommand prints help.
 
 mod catalog_cmd;
+mod lock;
 mod output;
 mod scan_cmd;
 mod term;
 mod watch;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
@@ -18,7 +20,9 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use catalog_cmd::SessionGuard;
 use di_core::Catalog;
 use di_core::search::{SearchError, SearchRequest, SortKey, search, summarize};
+use di_scan::controller::{ControllerOptions, NewDrivePolicy, Policy};
 use di_scan::device::{DeviceScanRequest, IdentityChoice};
+use di_tui::TuiOptions;
 use di_scan::{ResumeMode, ScanRequest};
 use di_walk::{Control, Progress, WalkConfig};
 
@@ -75,6 +79,19 @@ enum Command {
         /// Drives: allow internal, non-removable disks (never the system disk)
         #[arg(long)]
         allow_internal: bool,
+    },
+    /// Interactive terminal UI (the default when run without a command in a terminal)
+    Tui {
+        /// Rescan known drives whose last scan is older than this (e.g. 30d, 12h, 0)
+        #[arg(long, default_value = "30d")]
+        rescan_after: String,
+        /// Treat attached disk images like drives (for testing)
+        #[arg(long)]
+        include_images: bool,
+        #[arg(long, value_enum, default_value_t = AfterArg::Eject)]
+        after: AfterArg,
+        #[arg(long, short = 'j')]
+        threads: Option<usize>,
     },
     /// Watch for drives being connected; scan them and eject when done
     Watch {
@@ -237,13 +254,19 @@ fn catalog_path(cli_db: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
-    let Some(command) = cli.command else {
-        Cli::command().print_help()?;
-        println!();
-        return Ok(ExitCode::SUCCESS);
-    };
     let db = catalog_path(cli.db)?;
     let accept_stale = cli.accept_stale;
+    let command = match cli.command {
+        Some(c) => c,
+        None if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() => {
+            Command::Tui { rescan_after: "30d".into(), include_images: false, after: AfterArg::Eject, threads: None }
+        }
+        None => {
+            Cli::command().print_help()?;
+            println!();
+            return Ok(ExitCode::SUCCESS);
+        }
+    };
     match command {
         Command::Scan {
             target,
@@ -278,6 +301,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     identity,
                     allow_internal,
                 };
+                let _lock = lock::lock_or_fail(&req.catalog_path)?;
                 let session = SessionGuard::begin(&req.catalog_path, accept_stale)?;
                 let code = scan_cmd::scan_device(&req, quiet)?;
                 session.end()?;
@@ -290,6 +314,35 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 Ok(code)
             }
         }
+        Command::Tui { rescan_after, include_images, after, threads } => {
+            let controller = ControllerOptions {
+                catalog_path: db.clone(),
+                policy: Policy {
+                    new_drive: NewDrivePolicy::Ask,
+                    rescan_after_secs: watch::parse_age(&rescan_after)?,
+                    after: after.to_after(),
+                    include_images,
+                },
+                walk: walk_config(threads)?,
+            };
+            let host = di_walk::host::hostname();
+            match lock::try_lock(&db)? {
+                Ok(_lock) => {
+                    let session = SessionGuard::begin(&db, accept_stale)?;
+                    di_tui::run(TuiOptions {
+                        catalog_path: db.clone(),
+                        host,
+                        controller: Some(controller),
+                        viewer_reason: None,
+                    })?;
+                    session.end()?;
+                }
+                Err(holder) => {
+                    di_tui::run(TuiOptions { catalog_path: db.clone(), host, controller: None, viewer_reason: Some(holder) })?
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Watch { scan_new, rescan_after, include_images, after, threads, quiet } => {
             let opts = watch::WatchOptions {
                 catalog_path: db,
@@ -300,6 +353,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 walk: walk_config(threads)?,
                 quiet,
             };
+            let _lock = lock::lock_or_fail(&opts.catalog_path)?;
             let session = SessionGuard::begin(&opts.catalog_path, accept_stale)?;
             let code = watch::run(&opts)?;
             session.end()?;

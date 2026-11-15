@@ -54,6 +54,20 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Short human duration: `850 ms`, `4.2 s`, `3m 07s`, `2h 05m`.
+pub fn format_duration(d: std::time::Duration) -> String {
+    let s = d.as_secs_f64();
+    if s < 1.0 {
+        format!("{:.0} ms", s * 1000.0)
+    } else if s < 60.0 {
+        format!("{s:.1} s")
+    } else if s < 3600.0 {
+        format!("{}m {:02}s", s as u64 / 60, s as u64 % 60)
+    } else {
+        format!("{}h {:02}m", s as u64 / 3600, (s as u64 % 3600) / 60)
+    }
+}
+
 /// Thousands separators for counts: `1,204,331`.
 pub fn format_count(n: u64) -> String {
     let s = n.to_string();

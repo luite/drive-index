@@ -1,0 +1,22 @@
+[package]
+name = "di-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+crossterm = "0.29.0"
+di-core = { version = "0.1.0", path = "../di-core" }
+di-doctor = { version = "0.1.0", path = "../di-doctor" }
+di-model = { version = "0.1.0", path = "../di-model" }
+di-platform = { version = "0.1.0", path = "../di-platform" }
+di-scan = { version = "0.1.0", path = "../di-scan" }
+di-walk = { version = "0.1.0", path = "../di-walk" }
+jiff = "0.2.45"
+ratatui = "0.30.2"
+rusqlite = "0.40.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"

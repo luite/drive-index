@@ -349,6 +349,29 @@ impl Catalog {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Set or clear (`None`) a drive's notes. Returns false if no such drive.
+    pub fn set_drive_notes(&self, drive_id: i64, notes: Option<&str>) -> Result<bool> {
+        Ok(self.conn.execute("UPDATE drives SET notes = ?2 WHERE id = ?1", params![drive_id, notes])? == 1)
+    }
+
+    /// Append to the persistent event log (shown on the Log screen).
+    pub fn log_event(&self, level: &str, drive_id: Option<i64>, kind: &str, message: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO events (ts, level, drive_id, kind, message) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![now_secs(), level, drive_id, kind, message],
+        )?;
+        Ok(())
+    }
+
+    /// Most recent events, newest first.
+    pub fn recent_events(&self, limit: usize) -> Result<Vec<EventRow>> {
+        let mut stmt = self.conn.prepare("SELECT ts, level, drive_id, message FROM events ORDER BY id DESC LIMIT ?1")?;
+        let rows = stmt.query_map([limit as i64], |r| {
+            Ok(EventRow { ts: r.get(0)?, level: r.get(1)?, drive_id: r.get(2)?, message: r.get(3)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Set or clear (`None`) a drive's user label. Returns false if no such drive.
     pub fn set_drive_label(&self, drive_id: i64, label: Option<&str>) -> Result<bool> {
         Ok(self.conn.execute("UPDATE drives SET label = ?2 WHERE id = ?1", params![drive_id, label])? == 1)
@@ -449,6 +472,14 @@ pub struct NewScan {
     pub mount_point: String,
     pub threads: usize,
     pub options_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EventRow {
+    pub ts: i64,
+    pub level: String,
+    pub drive_id: Option<i64>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

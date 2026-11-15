@@ -16,6 +16,7 @@ di-doctor = { version = "0.1.0", path = "../di-doctor" }
 di-model = { version = "0.1.0", path = "../di-model" }
 di-platform = { version = "0.1.0", path = "../di-platform" }
 di-scan = { version = "0.1.0", path = "../di-scan" }
+di-tui = { version = "0.1.0", path = "../di-tui" }
 di-walk = { version = "0.1.0", path = "../di-walk" }
 directories = "6.0.0"
 jiff = "0.2.45"
