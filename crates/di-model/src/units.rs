@@ -54,6 +54,20 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Short human age or interval in whole seconds: `45s`, `12m`, `5h`, `3d`, `4mo`, `2y`.
+/// Negative values (clock skew) count as 0.
+pub fn format_age(secs: i64) -> String {
+    const DAY: i64 = 86_400;
+    match secs.max(0) {
+        s if s < 120 => format!("{s}s"),
+        s if s < 7200 => format!("{}m", s / 60),
+        s if s < 2 * DAY => format!("{}h", s / 3600),
+        s if s < 60 * DAY => format!("{}d", s / DAY),
+        s if s < 730 * DAY => format!("{}mo", s / (30 * DAY)),
+        s => format!("{}y", s / (365 * DAY)),
+    }
+}
+
 /// Short human duration: `850 ms`, `4.2 s`, `3m 07s`, `2h 05m`.
 pub fn format_duration(d: std::time::Duration) -> String {
     let s = d.as_secs_f64();
@@ -103,5 +117,9 @@ mod tests {
         assert_eq!(format_size(25_270_000), "24.1 MiB");
         assert_eq!(format_count(1_204_331), "1,204,331");
         assert_eq!(format_count(12), "12");
+        let ages = [(-5, "0s"), (90, "90s"), (600, "10m"), (5 * 3600, "5h"), (30 * 86_400, "30d"), (90 * 86_400, "3mo"), (800 * 86_400, "2y")];
+        for (secs, text) in ages {
+            assert_eq!(format_age(secs), text, "{secs}");
+        }
     }
 }

@@ -59,14 +59,9 @@ fn local_ns(ns: Option<i64>) -> String {
 
 fn ago(secs: Option<i64>) -> String {
     let Some(s) = secs else { return "never".into() };
-    let d = di_core::now_secs() - s;
-    match d {
+    match di_core::now_secs() - s {
         d if d < 120 => "now".into(),
-        d if d < 7200 => format!("{}m", d / 60),
-        d if d < 2 * 86_400 => format!("{}h", d / 3600),
-        d if d < 60 * 86_400 => format!("{}d", d / 86_400),
-        d if d < 730 * 86_400 => format!("{}mo", d / (30 * 86_400)),
-        d => format!("{}y", d / (365 * 86_400)),
+        d => di_model::units::format_age(d),
     }
 }
 

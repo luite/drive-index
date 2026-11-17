@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 
-use di_model::units::format_size;
+use di_model::units::{format_age, format_size};
 use di_platform::DriveProbe;
 use di_scan::controller::{Controller, ControllerOptions, Event, NewDrivePolicy, Outcome, Policy, Question};
 use di_scan::device::{After, report_lines};
@@ -43,15 +43,6 @@ pub fn parse_age(s: &str) -> Result<i64> {
     Ok(n * mult)
 }
 
-pub fn humanize_age(secs: i64) -> String {
-    match secs {
-        s if s < 120 => format!("{s}s"),
-        s if s < 7200 => format!("{}m", s / 60),
-        s if s < 2 * 86_400 => format!("{}h", s / 3600),
-        s => format!("{}d", s / 86_400),
-    }
-}
-
 pub fn describe_probe(p: &DriveProbe) -> String {
     format!("{} ({} {}, {})", p.dev_path, p.model.as_deref().unwrap_or("drive"), format_size(p.capacity_bytes), p.bus.as_str())
 }
@@ -71,7 +62,7 @@ fn print_event(printer: &Printer, ev: Event) {
                 Outcome::Queued => printer.say(format!("{who} connected: {desc}; scanning.")),
                 Outcome::UpToDate { last_scan } => printer.say(format!(
                     "{who} connected: {desc}; up to date (last scan {} ago).",
-                    humanize_age(now - last_scan)
+                    format_age(now - last_scan)
                 )),
                 Outcome::Reported => printer.say(format!(
                     "New drive {desc} is not in the catalog. Scan it with `drive-index scan {}`, or watch with --scan-new.",
@@ -121,7 +112,7 @@ pub fn run(opts: &WatchOptions) -> Result<ExitCode> {
     term.say(format!(
         "Watching for drives (new drives: {}; rescan known drives after {}; then {}). Ctrl-C to stop.",
         if opts.scan_new { "scan" } else { "report only" },
-        humanize_age(opts.rescan_after_secs),
+        format_age(opts.rescan_after_secs),
         match opts.after {
             After::Eject => "eject",
             After::Unmount => "unmount",
