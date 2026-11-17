@@ -26,8 +26,15 @@ pub use walk::{
 // produces a burst of them. They are treated differently from per-file errors
 // (EACCES, ENOENT, ELOOP, ...):
 //
+//  * the walk retries directories that failed this way when a scan is resumed,
+//    since the failure was probably the connection, not the directory
+//    (see `Staging::requeue_device_errors` in di-scan);
 //  * the content phase stops reading from a drive that keeps failing reads
 //    (see Note [Drive trouble] in di-scan:content).
+//
+// On a disk with a genuinely unreadable sector, EIO is permanent; the directory is
+// then retried on every resume until a walk completes, after which the error is
+// recorded like any other.
 
 /// Is this errno a failure of the device rather than of one file?
 /// See Note [Device errors].

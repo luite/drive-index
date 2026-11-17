@@ -70,7 +70,30 @@ pub enum ScanStatus {
     Complete,
     /// Cancelled; staging kept, resumable.
     Interrupted,
+    /// The filesystem went away during the walk (drive unplugged or failed): nothing
+    /// merged, staging kept, resumable. See Note [Merging only what was really read].
+    Lost,
 }
+
+// Note [Merging only what was really read]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// A merge replaces the catalog's rows for a filesystem with the staging rows. If the
+// drive disappears mid-walk, the walker does not stop: every directory it still
+// lists fails at once (EIO, ENODEV), so the walk "completes" in a moment with most of
+// the tree missing. Merging that would throw away a good earlier scan.
+//
+// So after the walk, before anything is merged, the scan root must still be the same
+// filesystem (stat succeeds, same device number) and the caller's `alive` check (for
+// drives: the device node still exists) must pass. Otherwise the scan is `Lost`: it
+// is recorded as interrupted, its staging DB is kept, and the next run resumes it.
+// Resuming requeues the directories that failed with device errors, so the ones
+// that failed during the disconnect are listed again (Note [Device errors] in
+// di-walk).
+//
+// Entries whose metadata could not be read while their directory was being listed at
+// the moment of the disconnect keep empty metadata and a `stat` error: re-listing
+// that directory would duplicate the subdirectories already recorded. This affects
+// at most one directory per walker thread.
 
 #[derive(Debug, Clone)]
 pub struct ScanOutcome {
@@ -109,7 +132,7 @@ pub fn run_dir_scan(req: &ScanRequest, control: &Control, progress: &Progress, p
         fs: host::fs_usage(&root),
     })?;
     let target = FsTarget { drive_id: ids.drive_id, filesystem_id: ids.filesystem_id, root };
-    let mut out = run_fs_scan(&mut catalog, &target, &req.walk, req.resume, control, progress, phase)?;
+    let mut out = run_fs_scan(&mut catalog, &target, &req.walk, req.resume, &|| true, control, progress, phase)?;
     if let (ScanStatus::Complete, Some(cfg)) = (out.status, &req.content) {
         phase.set(Phase::Content);
         out.content = Some(run_content(&mut catalog, target.filesystem_id, &target.root, cfg, control, progress, &mut |_| {})?);
@@ -129,11 +152,15 @@ pub struct FsTarget {
 
 /// Scan one catalog filesystem at `target.root`: staging, walk, aggregates, merge.
 /// Resumes an interrupted scan of the same filesystem unless `resume` is Restart.
+/// `alive` says whether the source is still there after the walk (for drives: the
+/// device still exists); see Note [Merging only what was really read].
+#[allow(clippy::too_many_arguments)]
 pub fn run_fs_scan(
     catalog: &mut Catalog,
     target: &FsTarget,
     walk_cfg: &WalkConfig,
     resume: ResumeMode,
+    alive: &dyn Fn() -> bool,
     control: &Control,
     progress: &Progress,
     phase: &PhaseCell,
@@ -172,8 +199,9 @@ pub fn run_fs_scan(
     }
 
     let (scan_id, staging, resumed_dirs) = match resumed {
-        Some((id, st)) => {
+        Some((id, mut st)) => {
             catalog.set_scan_status(id, "running")?;
+            st.requeue_device_errors()?;
             let done = st.listed_dirs()?;
             (id, st, Some(done))
         }
@@ -227,8 +255,14 @@ pub fn run_fs_scan(
         content: None,
     };
 
-    if outcome == WalkOutcome::Cancelled {
+    // See Note [Merging only what was really read].
+    let same_fs = stat_path(root).is_ok_and(|(_, m)| m.dev == root_meta.dev);
+    let lost = !same_fs || !alive();
+    if outcome == WalkOutcome::Cancelled || lost {
         catalog.set_scan_status(scan_id, "interrupted")?;
+        if lost {
+            result.status = ScanStatus::Lost;
+        }
         phase.set(Phase::Done);
         return Ok(result);
     }

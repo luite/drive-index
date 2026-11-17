@@ -28,7 +28,8 @@ Runs on macOS and Linux. Written in Rust.
   by the system are scanned as they are.
 - **Careful with failing drives.** Every filesystem on a drive is catalogued before any file
   contents are read. If reads start failing or hanging, drive-index stops reading and leaves
-  the rest for a later scan.
+  the rest for a later scan. A drive that disconnects mid-scan never replaces its earlier
+  catalog entries with a partial scan; connecting it again continues where it stopped.
 - **Fast.** A parallel directory walker uses `getattrlistbulk` on macOS and
   `getdents64` + `statx` in inode order on Linux. Results go into a per-scan staging database
   first, so an interrupted scan (unplugged, stopped, crashed) resumes where it stopped.

@@ -507,6 +507,11 @@ fn ioreg_path(class: &str, bsd: &str) -> Option<Vec<Dictionary>> {
 // Mount / unmount / eject
 // -------------------------------------------------------------------------------------
 
+/// devfs removes `/dev/diskN` as soon as the disk (or disk image) is detached.
+pub fn is_present(drive: &DriveProbe) -> bool {
+    std::path::Path::new(&drive.dev_path).exists()
+}
+
 pub fn mount_ro(vol: &VolumeProbe) -> Result<PathBuf> {
     if let Some(mp) = &vol.mount_point {
         return Ok(mp.clone());

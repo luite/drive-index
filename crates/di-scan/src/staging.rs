@@ -134,6 +134,40 @@ impl Staging {
         Ok(set)
     }
 
+    /// Put directories whose listing failed with a device error back in the queue,
+    /// and forget those errors. Returns how many were requeued.
+    /// See Note [Device errors] in di-walk.
+    pub fn requeue_device_errors(&mut self) -> Result<u64> {
+        let failed: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare("SELECT rowid, path, errno FROM scan_errors WHERE op = 'readdir'")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i32>>(2)?)))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (rowid, path, errno) = row?;
+                if errno.is_some_and(di_walk::is_device_errno) {
+                    out.push((rowid, path));
+                }
+            }
+            out
+        };
+        let tx = self.conn.transaction()?;
+        let mut requeued = 0;
+        {
+            let mut requeue = tx.prepare(&format!(
+                "UPDATE dirs SET state = 0, flags = flags & ~{f} WHERE state = {err} AND path = ?1",
+                f = flags::LIST_ERROR,
+                err = DirState::Error as u8
+            ))?;
+            let mut forget = tx.prepare("DELETE FROM scan_errors WHERE rowid = ?1")?;
+            for (rowid, path) in &failed {
+                requeued += requeue.execute([path])? as u64;
+                forget.execute([rowid])?;
+            }
+        }
+        tx.commit()?;
+        Ok(requeued)
+    }
+
     pub fn listed_dirs(&self) -> Result<u64> {
         Ok(self.conn.query_row("SELECT count(*) FROM dirs WHERE state != 0", [], |r| r.get::<_, i64>(0))? as u64)
     }
@@ -350,4 +384,67 @@ fn apply(conn: &Connection, batch: DirBatch, hardlinks: &mut HashSet<u64>) -> Re
         }
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use di_walk::{DirRow, ErrorRow};
+
+    fn subdir(id: u64, name: &str) -> DirRow {
+        DirRow {
+            id,
+            parent_id: 1,
+            name: name.into(),
+            name_raw: None,
+            path: format!("/{name}"),
+            os_path: name.as_bytes().to_vec(),
+            depth: 1,
+            meta: Meta::default(),
+            state: DirState::Pending,
+        }
+    }
+
+    fn failed(dir_id: u64, path: &str, errno: i32) -> DirBatch {
+        DirBatch {
+            dir_id,
+            state: DirState::Error,
+            entry_count: 0,
+            dir_flags: flags::LIST_ERROR,
+            files: vec![],
+            subdirs: vec![],
+            errors: vec![ErrorRow { path: path.into(), op: "readdir", errno: Some(errno), message: String::new() }],
+        }
+    }
+
+    #[test]
+    fn device_errors_are_retried_on_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = Staging::create(&tmp.path().join("s.db"), 1, &Meta::default()).unwrap();
+        let mut links = HashSet::new();
+        let root = DirBatch {
+            dir_id: 1,
+            state: DirState::Listed,
+            entry_count: 2,
+            dir_flags: 0,
+            files: vec![],
+            subdirs: vec![subdir(2, "gone"), subdir(3, "private")],
+            errors: vec![],
+        };
+        apply(&st.conn, root, &mut links).unwrap();
+        // One fails because the drive went away, the other for lack of permission.
+        apply(&st.conn, failed(2, "/gone", libc::EIO), &mut links).unwrap();
+        apply(&st.conn, failed(3, "/private", libc::EACCES), &mut links).unwrap();
+        assert!(st.pending_jobs().unwrap().is_empty());
+
+        assert_eq!(st.requeue_device_errors().unwrap(), 1);
+        let jobs: Vec<String> = st.pending_jobs().unwrap().into_iter().map(|j| j.path).collect();
+        assert_eq!(jobs, vec!["/gone".to_string()]);
+        let errors: Vec<String> =
+            st.conn.prepare("SELECT path FROM scan_errors").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        assert_eq!(errors, vec!["/private".to_string()]);
+        let f: u32 = st.conn.query_row("SELECT flags FROM dirs WHERE id = 2", [], |r| r.get(0)).unwrap();
+        assert_eq!(f & flags::LIST_ERROR, 0);
+        assert_eq!(st.requeue_device_errors().unwrap(), 0, "nothing left to requeue");
+    }
 }

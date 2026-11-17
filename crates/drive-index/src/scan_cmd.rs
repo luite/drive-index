@@ -58,6 +58,15 @@ pub fn scan_dir(req: &ScanRequest, quiet: bool) -> Result<ExitCode> {
             );
             Ok(ExitCode::from(130))
         }
+        ScanStatus::Lost => {
+            println!(
+                "Scan #{} stopped: {} went away during the scan (unmounted or disconnected). The catalog was not \
+                 changed; run the same command again to resume.",
+                out.scan_id,
+                req.dir.display()
+            );
+            Ok(ExitCode::FAILURE)
+        }
     }
 }
 
@@ -86,7 +95,9 @@ pub fn scan_device(req: &DeviceScanRequest, quiet: bool) -> Result<ExitCode> {
     let report = result?;
     summarize(&printer, &report);
     let failed = report.volumes.iter().any(|v| matches!(v.outcome, VolumeOutcome::Failed(_)));
-    Ok(if report.interrupted {
+    Ok(if report.disconnected {
+        ExitCode::FAILURE
+    } else if report.interrupted {
         ExitCode::from(130)
     } else if failed {
         ExitCode::FAILURE

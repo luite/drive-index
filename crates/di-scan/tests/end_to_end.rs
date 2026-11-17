@@ -397,6 +397,46 @@ fn duplicates_and_coverage_across_drives() {
 }
 
 #[test]
+fn walk_of_a_vanished_source_is_not_merged() {
+    use di_scan::{FsTarget, run_fs_scan};
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("index.db");
+    let data = tmp.path().join("data");
+    photo_tree(&data);
+    let first = scan(&db, &data);
+
+    // Rescan, but the source is gone by the end of the walk.
+    write(&data.join("Docs/new.txt"), 5);
+    let target = FsTarget { drive_id: first.drive_id, filesystem_id: first.filesystem_id, root: data.canonicalize().unwrap() };
+    let walk = WalkConfig { threads: 2, ..WalkConfig::default() };
+    let mut cat = Catalog::open(&db).unwrap();
+    let lost = run_fs_scan(
+        &mut cat,
+        &target,
+        &walk,
+        ResumeMode::Auto,
+        &|| false,
+        &Control::default(),
+        &Progress::default(),
+        &PhaseCell::default(),
+    )
+    .unwrap();
+    drop(cat);
+    assert_eq!(lost.status, ScanStatus::Lost);
+    {
+        let cat = Catalog::open_readonly(&db).unwrap();
+        assert_eq!(paths(&cat, "ext:txt"), set(&["/Docs/notes.txt"]), "the earlier scan is untouched");
+        assert_eq!(cat.scans(1).unwrap()[0].status, "interrupted");
+    }
+
+    // The next run resumes that scan and merges it.
+    let again = scan(&db, &data);
+    assert_eq!((again.status, again.scan_id), (ScanStatus::Complete, lost.scan_id));
+    let cat = Catalog::open_readonly(&db).unwrap();
+    assert_eq!(paths(&cat, "ext:txt"), set(&["/Docs/notes.txt", "/Docs/new.txt"]));
+}
+
+#[test]
 fn walk_plan_follows_the_last_complete_scan() {
     use di_scan::device::{WalkPlan, walk_plan};
     let tmp = tempfile::tempdir().unwrap();

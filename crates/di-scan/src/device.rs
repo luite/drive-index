@@ -35,6 +35,10 @@ use crate::run::{FsTarget, Phase, PhaseCell, ResumeMode, ScanOutcome, ScanStatus
 // short. Scans that start on their own when a known drive is connected use the
 // policy's --rescan-after (30 days by default); explicit scans pass 0 and walk
 // everything.
+//
+// If the drive disappears (Note [Merging only what was really read] in di-scan:run),
+// the filesystems not reached yet are reported as such, nothing is unmounted or
+// ejected, and the next scan carries on where this one stopped.
 
 /// Does a filesystem need walking? See Note [Walk first, read later].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,12 +99,14 @@ pub struct DeviceScanRequest {
 
 #[derive(Debug)]
 pub enum VolumeOutcome {
-    /// Walked in this run (complete or interrupted: see the status).
+    /// Walked in this run (complete, interrupted or lost: see the status).
     Scanned(Box<ScanOutcome>),
     /// Not walked: scanned completely at `last_scan`, recently enough.
     UpToDate { last_scan: i64 },
     Skipped(String),
     Failed(String),
+    /// Not reached: the drive disconnected first.
+    Disconnected,
 }
 
 #[derive(Debug)]
@@ -127,6 +133,8 @@ pub struct DeviceReport {
     pub unmounted: bool,
     pub ejected: bool,
     pub interrupted: bool,
+    /// The drive disappeared during the scan.
+    pub disconnected: bool,
     /// Reading file contents stopped because the drive is not reading reliably.
     pub trouble: Option<DriveTrouble>,
     pub smart: Option<Result<SmartReport, SmartUnavailable>>,
@@ -146,6 +154,8 @@ pub enum Step<'a> {
     /// Content phase starting for a volume, with this many files to read.
     Content { vol: &'a VolumeProbe, files: u64 },
     ContentDone(&'a VolumeProbe, &'a ContentOutcome),
+    /// The drive is gone; nothing more is attempted.
+    Disconnected(&'a DriveProbe),
     Unmounting,
     Ejecting,
 }
@@ -315,18 +325,23 @@ pub fn scan_device(
         unmounted: false,
         ejected: false,
         interrupted: false,
+        disconnected: false,
         trouble: None,
         smart,
     };
+    let present = || di_platform::is_present(&probe);
     let now = di_core::now_secs();
 
     // Stage 1: walk every filesystem. See Note [Walk first, read later].
     // Mounted filesystems for stage 2, by index into `probe.volumes` / `report.volumes`.
     let mut to_read: Vec<(usize, FsTarget)> = Vec::new();
     for (i, (vol, &fs_id)) in probe.volumes.iter().zip(&fs_ids).enumerate() {
-        let outcome = 'outcome: {
+        let mut outcome = 'outcome: {
             if let Some(reason) = &vol.unscannable_reason {
                 break 'outcome VolumeOutcome::Skipped(reason.clone());
+            }
+            if report.disconnected {
+                break 'outcome VolumeOutcome::Disconnected;
             }
             if control.is_cancelled() {
                 break 'outcome VolumeOutcome::Skipped("cancelled".into());
@@ -361,12 +376,12 @@ pub fn scan_device(
                 WalkPlan::Walk => {
                     on_step(Step::Scanning { vol, mount_point: &target.root });
                     reset_progress(progress);
-                    match run_fs_scan(&mut catalog, &target, &req.walk, req.resume, control, progress, phase) {
+                    match run_fs_scan(&mut catalog, &target, &req.walk, req.resume, &present, control, progress, phase) {
                         Ok(out) => {
                             on_step(Step::Scanned(vol, &out));
                             match out.status {
                                 ScanStatus::Complete => to_read.push((i, target)),
-                                ScanStatus::Interrupted => report.interrupted = true,
+                                ScanStatus::Interrupted | ScanStatus::Lost => report.interrupted = true,
                             }
                             VolumeOutcome::Scanned(Box::new(out))
                         }
@@ -375,6 +390,14 @@ pub fn scan_device(
                 }
             }
         };
+        if !report.disconnected && !present() {
+            report.disconnected = true;
+            on_step(Step::Disconnected(&probe));
+            // Failing because the drive went away is not the filesystem's fault.
+            if matches!(outcome, VolumeOutcome::Failed(_)) {
+                outcome = VolumeOutcome::Disconnected;
+            }
+        }
         report.volumes.push(VolumeReport {
             dev: vol.dev.clone(),
             fs_type: vol.fs_type.clone(),
@@ -389,7 +412,7 @@ pub fn scan_device(
     // Stage 2: read file contents of the filesystems mounted above.
     if let Some(cfg) = &req.content {
         for (i, target) in &to_read {
-            if report.trouble.is_some() || control.is_cancelled() {
+            if report.disconnected || report.trouble.is_some() || control.is_cancelled() {
                 break;
             }
             let vol = &probe.volumes[*i];
@@ -405,6 +428,10 @@ pub fn scan_device(
                 Err(e) => report.volumes[*i].outcome = VolumeOutcome::Failed(format!("content phase: {e:#}")),
             }
             phase.set(Phase::Done);
+            if !present() {
+                report.disconnected = true;
+                on_step(Step::Disconnected(&probe));
+            }
         }
     }
 
@@ -412,6 +439,7 @@ pub fn scan_device(
     // Drive trouble does not count: the walk is complete, and the files left to read
     // wait for a later scan whether the drive stays mounted or not.
     let all_done = !report.interrupted
+        && !report.disconnected
         && report.volumes.iter().all(|v| !matches!(v.outcome, VolumeOutcome::Failed(_)));
     if all_done && req.after != After::KeepMounted {
         on_step(Step::Unmounting);
@@ -500,6 +528,7 @@ pub fn step_text(step: &Step, threads: usize) -> Option<String> {
         Step::Scanned(v, out) => match out.status {
             ScanStatus::Complete => format!("  {}: {}", v.dev, describe_outcome(out, threads)),
             ScanStatus::Interrupted => format!("  {}: interrupted (resumes next time)", v.dev),
+            ScanStatus::Lost => format!("  {}: the filesystem went away during the scan (resumes next time)", v.dev),
         },
         Step::Content { vol, files } => format!(
             "  {}: reading {} {} for metadata and hashes…",
@@ -532,6 +561,7 @@ pub fn step_text(step: &Step, threads: usize) -> Option<String> {
             }
             t
         }
+        Step::Disconnected(p) => format!("  {} disconnected", p.dev_path),
         Step::Scanning { .. } | Step::Unmounting | Step::Ejecting => return None,
     })
 }
@@ -545,6 +575,9 @@ pub fn report_lines(r: &DeviceReport) -> Vec<String> {
                 out.push(format!("  {} {}: skipped — {reason}", v.dev, v.fs_type))
             }
             VolumeOutcome::Failed(e) => out.push(format!("  {} {}: FAILED — {e}", v.dev, v.fs_type)),
+            VolumeOutcome::Disconnected => {
+                out.push(format!("  {} {}: not scanned — the drive disconnected first", v.dev, v.fs_type))
+            }
             _ => {}
         }
     }
@@ -561,7 +594,9 @@ pub fn report_lines(r: &DeviceReport) -> Vec<String> {
         ));
     }
     let dev = &r.dev_path;
-    out.push(if r.ejected {
+    out.push(if r.disconnected {
+        format!("{dev} disconnected during the scan; connect it again to continue where it stopped.")
+    } else if r.ejected {
         format!("Ejected {dev} — safe to remove.")
     } else if r.unmounted {
         format!("Unmounted {dev}.")

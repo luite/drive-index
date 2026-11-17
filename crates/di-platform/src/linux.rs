@@ -474,6 +474,12 @@ fn no_interaction() -> HashMap<&'static str, Value<'static>> {
     HashMap::from([("auth.no_user_interaction", Value::from(true))])
 }
 
+/// The kernel removes a disk's sysfs entry when it goes away. A detached loop device
+/// keeps its entry (and /dev node) but has size 0.
+pub fn is_present(drive: &DriveProbe) -> bool {
+    read_trim(sysfs_block(&drive.id).join("size")).and_then(|s| s.parse::<u64>().ok()).is_some_and(|n| n > 0)
+}
+
 pub fn mount_ro(vol: &VolumeProbe) -> Result<PathBuf> {
     if let Some(mp) = &vol.mount_point {
         return Ok(mp.clone());

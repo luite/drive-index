@@ -211,6 +211,12 @@ fn mark_efi(p: &mut DriveProbe) {
     }
 }
 
+/// Is the drive still attached? Cheap enough to ask often: no udisks/DiskArbitration
+/// round trip.
+pub fn is_present(drive: &DriveProbe) -> bool {
+    sys::is_present(drive)
+}
+
 /// Mount a volume read-only (and hidden from Finder on macOS). Returns the mount point.
 /// If it is already mounted, returns the existing mount point unchanged.
 pub fn mount_ro(vol: &VolumeProbe) -> anyhow::Result<PathBuf> {
