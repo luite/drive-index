@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use di_core::Catalog;
 use di_core::drives::{DriveMatch, DriveRecord, FsRecord, PartitionRecord};
 use di_model::smart::{SmartReport, SmartUnavailable};
-use di_platform::{DriveProbe, VolumeProbe, identity};
+use di_platform::{DriveProbe, Medium, VolumeProbe, identity};
 use di_walk::{Control, Progress, WalkConfig, host};
 
 use crate::content::{ContentOutcome, DriveTrouble};
@@ -233,6 +233,14 @@ fn enrich(rec: &mut DriveRecord, s: &SmartReport) {
     }
     if rec.rotation_rpm.is_none() {
         rec.rotation_rpm = s.rotation_rpm;
+    }
+    // See Note [Rotational or not] in di-platform:linux.
+    if rec.medium == Medium::Unknown.as_str() {
+        match s.rotation_rpm {
+            Some(0) => rec.medium = Medium::Ssd.as_str().to_string(),
+            Some(_) => rec.medium = Medium::Hdd.as_str().to_string(),
+            None => {}
+        }
     }
     for i in identity::smart_identifiers(s) {
         if !rec.identifiers.iter().any(|x| x.kind == i.kind && x.value == i.value) {

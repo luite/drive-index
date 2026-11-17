@@ -201,6 +201,50 @@ fn sysfs_block(name: &str) -> PathBuf {
     PathBuf::from("/sys/class/block").join(name)
 }
 
+// Note [Rotational or not]
+// ~~~~~~~~~~~~~~~~~~~~~~~~
+// udisks' RotationRate comes from the drive's ATA IDENTIFY data (via udev), when that
+// got through: 0 for solid state, the rpm for a hard disk, -1 when unknown.
+//
+// Otherwise there is the kernel's queue/rotational flag. For NVMe, MMC and virtio
+// disks the driver sets it, and it is right. For SCSI disks (sd*: SATA through
+// libata, USB, SAS) it defaults to 1 and is only cleared when the device's Block
+// Device Characteristics VPD page (B1h) says "non-rotating". USB bridges often don't
+// provide that page (usb-storage does not even ask for it), so a USB stick reads as
+// rotational. For sd* devices we read the page ourselves (sysfs `vpd_pgb1`, bytes
+// 4-5: 1 = non-rotating, 0x0401-0xfffe = rpm, 0 = not reported) and say "unknown"
+// when it does not tell.
+//
+// A SMART reading can still fill in the medium later (`enrich` in di-scan:device).
+
+/// Medium and rpm of a whole disk; `rotation_rate` is udisks' RotationRate.
+/// See Note [Rotational or not].
+fn medium(whole_name: &str, rotation_rate: Option<i64>) -> (Medium, Option<u32>) {
+    match rotation_rate {
+        Some(0) => return (Medium::Ssd, None),
+        Some(n) if n > 0 => return (Medium::Hdd, u32::try_from(n).ok()),
+        _ => {}
+    }
+    if whole_name.starts_with("sd") {
+        let page = std::fs::read(sysfs_block(whole_name).join("device/vpd_pgb1")).unwrap_or_default();
+        return medium_from_vpd_b1(&page);
+    }
+    match read_trim(sysfs_block(whole_name).join("queue/rotational")).as_deref() {
+        Some("0") => (Medium::Ssd, None),
+        Some("1") => (Medium::Hdd, None),
+        _ => (Medium::Unknown, None),
+    }
+}
+
+/// Medium rotation rate from a Block Device Characteristics VPD page.
+fn medium_from_vpd_b1(page: &[u8]) -> (Medium, Option<u32>) {
+    match page.get(4..6).map(|b| u16::from_be_bytes([b[0], b[1]])) {
+        Some(1) => (Medium::Ssd, None),
+        Some(rpm @ 0x0401..=0xfffe) => (Medium::Hdd, Some(rpm as u32)),
+        _ => (Medium::Unknown, None),
+    }
+}
+
 /// Properties from the udev database (`/run/udev/data/b<maj>:<min>`, world-readable).
 fn udev_props(name: &str) -> HashMap<String, String> {
     let Some(devno) = read_trim(sysfs_block(name).join("dev")) else { return HashMap::new() };
@@ -351,16 +395,7 @@ pub fn probe(dev: &str) -> Result<DriveProbe> {
         "" => Bus::Other("unknown".into()),
         other => Bus::Other(other.to_string()),
     };
-    let rotation = o.i64(d, DRIVE, "RotationRate");
-    let medium = match rotation {
-        Some(0) => Medium::Ssd,
-        Some(n) if n > 0 => Medium::Hdd,
-        _ => match read_trim(sysfs_block(&whole_name).join("queue/rotational")).as_deref() {
-            Some("0") => Medium::Ssd,
-            Some("1") => Medium::Hdd,
-            _ => Medium::Unknown,
-        },
-    };
+    let (medium, rotation_rpm) = medium(&whole_name, o.i64(d, DRIVE, "RotationRate"));
     let removable = o.bool(d, DRIVE, "Removable").unwrap_or(false) || o.bool(d, DRIVE, "MediaRemovable").unwrap_or(false);
     let ptable_type = match o.str(&whole, PTABLE, "Type").as_deref() {
         Some("gpt") => Some("gpt".to_string()),
@@ -455,7 +490,7 @@ pub fn probe(dev: &str) -> Result<DriveProbe> {
         logical_block_size: read_trim(sysfs_block(&whole_name).join("queue/logical_block_size")).and_then(|s| s.parse().ok()),
         physical_block_size: read_trim(sysfs_block(&whole_name).join("queue/physical_block_size")).and_then(|s| s.parse().ok()),
         medium,
-        rotation_rpm: rotation.filter(|&n| n > 0).map(|n| n as u32),
+        rotation_rpm,
         usb: if bus == Bus::Usb { usb_info(&whole_name) } else { None },
         ptable_uuid: udev.get("ID_PART_TABLE_UUID").cloned(),
         ptable_type,
@@ -657,4 +692,23 @@ pub fn polkit_check(action: &str) -> Result<AuthAnswer> {
     } else {
         AuthAnswer::No
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vpd_b1_rotation_rate() {
+        let page = |rate: u16| {
+            let [hi, lo] = rate.to_be_bytes();
+            vec![0x00, 0xb1, 0x00, 0x3c, hi, lo, 0, 0]
+        };
+        assert_eq!(medium_from_vpd_b1(&page(1)), (Medium::Ssd, None));
+        assert_eq!(medium_from_vpd_b1(&page(7200)), (Medium::Hdd, Some(7200)));
+        // Not reported, reserved values, and no page at all: a USB stick, say.
+        for p in [page(0), page(2), page(0xffff), vec![], vec![0, 0xb1, 0]] {
+            assert_eq!(medium_from_vpd_b1(&p), (Medium::Unknown, None), "{p:?}");
+        }
+    }
 }
