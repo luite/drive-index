@@ -64,6 +64,9 @@ fn print_event(printer: &Printer, ev: Event) {
                     "{who} connected: {desc}; up to date (last scan {} ago).",
                     format_age(now - last_scan)
                 )),
+                Outcome::NothingToScan(why) => {
+                    printer.say(format!("{who} connected: {desc}; nothing on it can be scanned ({why})."))
+                }
                 Outcome::Reported => printer.say(format!(
                     "New drive {desc} is not in the catalog. Scan it with `drive-index scan {}`, or watch with --scan-new.",
                     probe.dev_path
@@ -88,7 +91,7 @@ fn print_event(printer: &Printer, ev: Event) {
         Event::JobStep { text, .. } => printer.say(text),
         Event::JobFinished { disk, result } => match result {
             Ok(report) => {
-                for line in report_lines(&report) {
+                for (_, line) in report_lines(&report) {
                     printer.say(line);
                 }
             }

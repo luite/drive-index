@@ -39,6 +39,16 @@ pub fn name(type_id: &str) -> Option<&'static str> {
     })
 }
 
+/// Partition types that hold no filesystem by design (reserved space, boot code, swap,
+/// volume-manager metadata, the extended-partition container), so finding none there
+/// is expected rather than worth reporting.
+pub fn holds_no_filesystem(type_id: &str) -> bool {
+    matches!(
+        name(type_id),
+        Some("Microsoft Reserved" | "BIOS boot" | "Windows LDM metadata" | "Linux swap" | "Extended" | "GPT protective")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -46,5 +56,13 @@ mod tests {
         assert_eq!(super::name("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"), Some("Microsoft Basic Data"));
         assert_eq!(super::name("0x07"), Some("NTFS / exFAT"));
         assert_eq!(super::name("0x99"), None);
+    }
+
+    #[test]
+    fn no_filesystem_expected() {
+        assert!(super::holds_no_filesystem("e3c9e316-0b5c-4db8-817d-f92df00215ae"));
+        assert!(super::holds_no_filesystem("0x82"));
+        assert!(!super::holds_no_filesystem("0x07"));
+        assert!(!super::holds_no_filesystem("0x99"));
     }
 }

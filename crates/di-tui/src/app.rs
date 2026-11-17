@@ -16,7 +16,7 @@ use di_core::views::{self, BrowseEntry, BrowseSort, DirInfo, DriveDetail, FileDe
 use di_doctor::Report;
 use di_platform::DriveProbe;
 use di_scan::controller::{Command, Controller, Event, Level, Outcome, Question};
-use di_scan::device::{IdentityChoice, report_lines};
+use di_scan::device::{IdentityChoice, report_lines, unscannable_summary};
 
 use crate::assist::{self, Candidate, Vocab};
 use crate::input::LineEdit;
@@ -69,6 +69,8 @@ pub enum ConnStatus {
     Queued,
     Scanning,
     UpToDate,
+    /// Known, but nothing on it can be scanned here (why).
+    NothingToScan(String),
     NeedsAnswer,
     Done(String),
     Failed(String),
@@ -406,10 +408,19 @@ impl App {
                         self.push_log(Level::Info, format!("{who} connected: {desc}; up to date."));
                         ConnStatus::UpToDate
                     }
+                    Outcome::NothingToScan(why) => {
+                        self.push_log(Level::Warn, format!("{who} connected: {desc}; nothing on it can be scanned ({why})."));
+                        ConnStatus::NothingToScan(why.clone())
+                    }
                     Outcome::Reported => ConnStatus::Idle,
                     Outcome::Ignored(_) => ConnStatus::Idle,
                     Outcome::Ask(Question::NewDrive) => {
-                        self.push_log(Level::Info, format!("New drive connected: {desc}."));
+                        if probe.volumes.iter().all(|v| !v.scannable()) {
+                            let why = unscannable_summary(&probe);
+                            self.push_log(Level::Warn, format!("New drive connected: {desc}; nothing on it can be scanned ({why})."));
+                        } else {
+                            self.push_log(Level::Info, format!("New drive connected: {desc}."));
+                        }
                         if self.modal.is_none() {
                             self.modal = Some(Modal::NewDrive { disk: disk.clone(), desc: desc.clone(), input: LineEdit::default() });
                         }
@@ -461,9 +472,9 @@ impl App {
                 let status = match result {
                     Ok(report) => {
                         let lines = report_lines(&report);
-                        let last = lines.last().cloned().unwrap_or_default();
-                        for l in lines {
-                            self.push_log(Level::Info, l.trim().to_string());
+                        let last = lines.last().map(|(_, l)| l.clone()).unwrap_or_default();
+                        for (level, l) in lines {
+                            self.push_log(level, l.trim().to_string());
                             self.job_lines.push_back(l);
                         }
                         if report.drive_id > 0 {

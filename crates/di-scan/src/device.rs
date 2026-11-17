@@ -12,6 +12,7 @@ use di_platform::{DriveProbe, Medium, VolumeProbe, identity};
 use di_walk::{Control, Progress, WalkConfig, host};
 
 use crate::content::{ContentOutcome, DriveTrouble};
+use crate::controller::Level;
 use crate::run::{FsTarget, Phase, PhaseCell, ResumeMode, ScanOutcome, ScanStatus, run_fs_scan};
 
 // Note [Walk first, read later]
@@ -39,6 +40,11 @@ use crate::run::{FsTarget, Phase, PhaseCell, ResumeMode, ScanOutcome, ScanStatus
 // If the drive disappears (Note [Merging only what was really read] in di-scan:run),
 // the filesystems not reached yet are reported as such, nothing is unmounted or
 // ejected, and the next scan carries on where this one stopped.
+//
+// A drive with no filesystem this host can scan (only a partition without a filesystem
+// blkid recognises, a locked encrypted volume, …) is recorded, the report says why
+// nothing was scanned, and it is left connected for the user to look at, whatever
+// `After` says.
 
 /// Does a filesystem need walking? See Note [Walk first, read later].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +139,9 @@ pub struct DeviceReport {
     pub unmounted: bool,
     pub ejected: bool,
     pub interrupted: bool,
+    /// No filesystem on the drive can be scanned on this host (the volumes say why), so
+    /// it was left connected. See Note [Walk first, read later].
+    pub nothing_scannable: bool,
     /// The drive disappeared during the scan.
     pub disconnected: bool,
     /// Reading file contents stopped because the drive is not reading reliably.
@@ -254,6 +263,19 @@ fn enrich(rec: &mut DriveRecord, s: &SmartReport) {
     rec.disk.wwn = rec.disk.wwn.take().or(smart.wwn);
 }
 
+/// Why nothing on a drive can be scanned: its volumes' reasons, one per volume.
+pub fn unscannable_summary(probe: &DriveProbe) -> String {
+    if probe.volumes.is_empty() {
+        return "no filesystems".into();
+    }
+    probe
+        .volumes
+        .iter()
+        .filter_map(|v| v.unscannable_reason.as_ref().map(|r| format!("{}: {r}", v.dev)))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Identify a probed drive and record it (and its filesystems) in the catalog.
 /// Returns `(drive_id, new, weak, filesystem ids in probe.volumes order)`.
 pub fn record_drive(
@@ -338,6 +360,7 @@ pub fn scan_device(
         unmounted: false,
         ejected: false,
         interrupted: false,
+        nothing_scannable: probe.volumes.iter().all(|v| !v.scannable()),
         disconnected: false,
         trouble: None,
         smart,
@@ -450,11 +473,12 @@ pub fn scan_device(
 
     // Leave the drive mounted if anything is unfinished, so the user can look or resume.
     // Drive trouble does not count: the walk is complete, and the files left to read
-    // wait for a later scan whether the drive stays mounted or not.
+    // wait for a later scan whether the drive stays mounted or not. A drive with nothing
+    // scannable stays connected (Note [Walk first, read later]).
     let all_done = !report.interrupted
         && !report.disconnected
         && report.volumes.iter().all(|v| !matches!(v.outcome, VolumeOutcome::Failed(_)));
-    if all_done && req.after != After::KeepMounted {
+    if all_done && !report.nothing_scannable && req.after != After::KeepMounted {
         on_step(Step::Unmounting);
         di_platform::unmount_drive(&probe, false)?;
         report.unmounted = true;
@@ -508,7 +532,13 @@ pub fn step_text(step: &Step, threads: usize) -> Option<String> {
             probe.model.as_deref().unwrap_or("drive"),
             format_size(probe.capacity_bytes),
             probe.bus.as_str(),
-            if probe.volumes.is_empty() { ", no filesystems" } else { "" }
+            if probe.volumes.is_empty() {
+                ", no filesystems"
+            } else if probe.volumes.iter().all(|v| !v.scannable()) {
+                ", nothing it can scan"
+            } else {
+                ""
+            }
         ),
         Step::Smart(Ok(s)) => {
             let mut t = format!("  SMART: {}", s.summary());
@@ -580,45 +610,58 @@ pub fn step_text(step: &Step, threads: usize) -> Option<String> {
 }
 
 /// Closing lines for a device report: skipped/failed volumes and the final state.
-pub fn report_lines(r: &DeviceReport) -> Vec<String> {
+pub fn report_lines(r: &DeviceReport) -> Vec<(Level, String)> {
     let mut out = Vec::new();
+    // When nothing could be scanned, the skipped volumes are the explanation.
+    let skipped = if r.nothing_scannable { Level::Warn } else { Level::Info };
     for v in &r.volumes {
         match &v.outcome {
             VolumeOutcome::Skipped(reason) if !reason.is_empty() => {
-                out.push(format!("  {} {}: skipped — {reason}", v.dev, v.fs_type))
+                out.push((skipped, format!("  {} {}: skipped — {reason}", v.dev, v.fs_type)))
             }
-            VolumeOutcome::Failed(e) => out.push(format!("  {} {}: FAILED — {e}", v.dev, v.fs_type)),
-            VolumeOutcome::Disconnected => {
-                out.push(format!("  {} {}: not scanned — the drive disconnected first", v.dev, v.fs_type))
-            }
+            VolumeOutcome::Failed(e) => out.push((Level::Error, format!("  {} {}: FAILED — {e}", v.dev, v.fs_type))),
+            VolumeOutcome::Disconnected => out.push((
+                Level::Warn,
+                format!("  {} {}: not scanned — the drive disconnected first", v.dev, v.fs_type),
+            )),
             _ => {}
         }
     }
     if let Some(t) = &r.trouble {
-        out.push(format!(
-            "  ⚠ the drive is not reading reliably: {}. Stopped reading file contents; the rest is read on a later scan.",
-            t.describe()
+        out.push((
+            Level::Warn,
+            format!(
+                "  ⚠ the drive is not reading reliably: {}. Stopped reading file contents; the rest is read on a later scan.",
+                t.describe()
+            ),
         ));
     }
     if r.weak_match {
-        out.push(format!(
-            "  note: recognised as D{} by weak identifiers only; if this is a different drive, rescan with --new-drive",
-            r.drive_id
+        out.push((
+            Level::Info,
+            format!(
+                "  note: recognised as D{} by weak identifiers only; if this is a different drive, rescan with --new-drive",
+                r.drive_id
+            ),
         ));
     }
     let dev = &r.dev_path;
     out.push(if r.disconnected {
-        format!("{dev} disconnected during the scan; connect it again to continue where it stopped.")
+        (Level::Warn, format!("{dev} disconnected during the scan; connect it again to continue where it stopped."))
+    } else if r.nothing_scannable && r.volumes.is_empty() {
+        (Level::Warn, format!("⚠ {dev} has no filesystems to scan; left connected."))
+    } else if r.nothing_scannable {
+        (Level::Warn, format!("⚠ Nothing on {dev} can be scanned (see above); left connected."))
     } else if r.ejected {
-        format!("Ejected {dev} — safe to remove.")
+        (Level::Info, format!("Ejected {dev} — safe to remove."))
     } else if r.unmounted {
-        format!("Unmounted {dev}.")
+        (Level::Info, format!("Unmounted {dev}."))
     } else if r.interrupted {
-        format!("{dev} left mounted read-only; the interrupted scan resumes when you scan it again.")
+        (Level::Info, format!("{dev} left mounted read-only; the interrupted scan resumes when you scan it again."))
     } else if r.volumes.iter().any(|v| matches!(v.outcome, VolumeOutcome::Failed(_))) {
-        format!("{dev} left mounted because a filesystem failed to scan.")
+        (Level::Warn, format!("{dev} left mounted because a filesystem failed to scan."))
     } else {
-        format!("{dev} left mounted read-only.")
+        (Level::Info, format!("{dev} left mounted read-only."))
     });
     out
 }

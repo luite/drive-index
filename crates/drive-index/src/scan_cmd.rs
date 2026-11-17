@@ -80,7 +80,7 @@ pub fn step_printer(printer: Printer, threads: usize) -> impl FnMut(Step) + Send
 }
 
 pub fn summarize(printer: &Printer, r: &DeviceReport) {
-    for line in report_lines(r) {
+    for (_, line) in report_lines(r) {
         printer.say(line);
     }
 }

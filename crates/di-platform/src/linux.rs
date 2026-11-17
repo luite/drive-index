@@ -325,6 +325,27 @@ fn unmountable_reason(fs: &str) -> Option<String> {
     }
 }
 
+/// Why a block without a recognised filesystem is worth reporting, if it is: a
+/// partition, a disk without a partition table, or an unlocked encrypted volume that
+/// should hold a filesystem but has none blkid knows. `ptype` is the partition's type.
+fn unrecognised_reason(ptype: Option<&str>, whole_disk: bool, cleartext: bool) -> Option<String> {
+    if whole_disk {
+        return Some("no partition table or filesystem found: blank, or encrypted as a whole (e.g. VeraCrypt)".into());
+    }
+    if cleartext {
+        return Some("no filesystem found inside the unlocked encrypted volume".into());
+    }
+    let ptype = ptype?;
+    if di_model::parttypes::holds_no_filesystem(ptype) {
+        return None;
+    }
+    let kind = match di_model::parttypes::name(ptype) {
+        Some(name) => format!("{ptype}, {name}"),
+        None => ptype.to_string(),
+    };
+    Some(format!("no filesystem signature found (partition type {kind}): unformatted, damaged or encrypted (e.g. VeraCrypt)"))
+}
+
 /// Mount options for a truly read-only mount.
 fn ro_options(fs: &str) -> &'static str {
     match fs {
@@ -455,6 +476,29 @@ pub fn probe(dev: &str) -> Result<DriveProbe> {
                     let mut v = mk(Some("encrypted volume is locked".into()));
                     v.encrypted = Some(true);
                     v.locked = Some(true);
+                    volumes.push(v);
+                }
+            }
+            // The UUID of a RAID, LVM or ZFS member names the array or pool, which all its
+            // members share: it identifies no single disk.
+            "raid" => {
+                let mut v = mk(Some(format!("{fs_type} member: RAID, LVM and ZFS pools are not supported")));
+                v.fs_uuid = None;
+                volumes.push(v);
+            }
+            // Nothing blkid recognises. Reported, so a drive whose filesystem cannot be
+            // read says so instead of looking empty.
+            "" if fs_type.is_empty() && o.u64(b, BLOCK, "Size").unwrap_or(0) > 0 => {
+                let container = o.bool(b, PARTITION, "IsContainer").unwrap_or(false);
+                let whole_disk = *b == whole && !o.has(b, PTABLE) && members.len() == 1;
+                let reason = if container {
+                    None
+                } else {
+                    unrecognised_reason(o.str(b, PARTITION, "Type").as_deref(), whole_disk, cleartext_of.is_some())
+                };
+                if let Some(reason) = reason {
+                    let mut v = mk(Some(reason));
+                    v.fs_type = "unknown".into();
                     volumes.push(v);
                 }
             }

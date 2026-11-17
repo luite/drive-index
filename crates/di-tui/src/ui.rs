@@ -185,6 +185,7 @@ fn status_glyph(s: &Option<ConnStatus>) -> Span<'static> {
         None => Span::raw("  "),
         Some(ConnStatus::Scanning) | Some(ConnStatus::Queued) => Span::styled("⟳ ", fg(Color::Cyan)),
         Some(ConnStatus::NeedsAnswer) => Span::styled("? ", fg(Color::Yellow)),
+        Some(ConnStatus::NothingToScan(_)) => Span::styled("! ", fg(Color::Yellow)),
         Some(ConnStatus::Failed(_)) => Span::styled("✖ ", fg(Color::Red)),
         Some(_) => Span::styled("● ", fg(Color::Green)),
     }
@@ -361,6 +362,7 @@ fn status_text(s: &ConnStatus) -> String {
         ConnStatus::Queued => "queued for scanning".into(),
         ConnStatus::Scanning => "scanning".into(),
         ConnStatus::UpToDate => "up to date".into(),
+        ConnStatus::NothingToScan(why) => format!("nothing to scan: {why}"),
         ConnStatus::NeedsAnswer => "waiting for your answer".into(),
         ConnStatus::Done(m) => m.clone(),
         ConnStatus::Failed(e) => format!("failed: {e}"),

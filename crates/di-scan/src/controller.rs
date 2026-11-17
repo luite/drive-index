@@ -20,7 +20,7 @@ use di_walk::{Control, Progress, WalkConfig};
 
 use crate::device::{
     After, DeviceReport, DeviceScanRequest, IdentityChoice, Step, WalkPlan, record_drive, report_lines, scan_device,
-    step_text, to_record, walk_plan,
+    step_text, to_record, unscannable_summary, walk_plan,
 };
 use crate::run::{PhaseCell, ResumeMode};
 
@@ -59,6 +59,17 @@ pub enum Level {
     Error,
 }
 
+impl Level {
+    /// As stored in the catalog's event log.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Level::Info => "info",
+            Level::Warn => "warn",
+            Level::Error => "error",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Question {
     /// Not in the catalog: scan it (and how to label it)?
@@ -73,6 +84,8 @@ pub enum Outcome {
     Queued,
     /// Known and recently scanned.
     UpToDate { last_scan: i64 },
+    /// Known, but no filesystem on it can be scanned on this host (why, per volume).
+    NothingToScan(String),
     /// The front end must decide.
     Ask(Question),
     /// New drive, policy says report only.
@@ -419,6 +432,9 @@ impl State {
                     Err(e) => return (Some(drive_id), None, Outcome::Ignored(format!("{e:#}"))),
                 };
                 let label = catalog.drive_label(drive_id).ok().flatten();
+                if probe.volumes.iter().all(|v| !v.scannable()) {
+                    return (Some(drive_id), label, Outcome::NothingToScan(unscannable_summary(probe)));
+                }
                 let now = di_core::now_secs();
                 let mut oldest: Option<i64> = None;
                 let mut stale = false;
@@ -454,8 +470,8 @@ impl State {
                     self.released.insert(a.disk.clone());
                 }
                 if let Ok(cat) = Catalog::open(&self.opts.catalog_path) {
-                    for line in report_lines(&report) {
-                        let _ = cat.log_event("info", Some(report.drive_id), "scan", line.trim());
+                    for (level, line) in report_lines(&report) {
+                        let _ = cat.log_event(level.as_str(), Some(report.drive_id), "scan", line.trim());
                     }
                 }
                 Ok(Box::new(report))
