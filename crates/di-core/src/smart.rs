@@ -73,6 +73,9 @@ impl Catalog {
 }
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<SmartView> {
+    let raw_json = r.get::<_, Option<String>>(14)?.unwrap_or_default();
+    // See Note [SMART details from smartctl's JSON] in di-model.
+    let (health_source, failing_attributes) = di_model::smart::details_of_raw(&raw_json);
     Ok(SmartView {
         taken_at: r.get(0)?,
         report: SmartReport {
@@ -89,7 +92,9 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<SmartView> {
             nvme_media_errors: r.get(11)?,
             nvme_unsafe_shutdowns: r.get(12)?,
             data_written_bytes: r.get(13)?,
-            raw_json: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
+            raw_json,
+            health_source,
+            failing_attributes,
             ..Default::default()
         },
     })

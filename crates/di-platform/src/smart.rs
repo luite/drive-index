@@ -137,6 +137,7 @@ pub fn parse(json: &str, device_type: &str) -> Result<SmartReport, Attempt> {
     };
     let block = int(&v, "/logical_block_size").unwrap_or(512);
     let data_written = nvme("data_units_written").map(|u| u * 512_000).or_else(|| attr(241).map(|lbas| lbas * block));
+    let (health_source, failing_attributes) = di_model::smart::details(&v);
     Ok(SmartReport {
         device_type: device_type.to_string(),
         protocol: text(&v, "/device/protocol"),
@@ -146,6 +147,8 @@ pub fn parse(json: &str, device_type: &str) -> Result<SmartReport, Attempt> {
         firmware: text(&v, "/firmware_version"),
         rotation_rpm: int(&v, "/rotation_rate").and_then(|r| u32::try_from(r).ok()),
         passed: v.pointer("/smart_status/passed").and_then(Value::as_bool),
+        health_source,
+        failing_attributes,
         temperature_c: int(&v, "/temperature/current").or_else(|| nvme("temperature")),
         power_on_hours: int(&v, "/power_on_time/hours").or_else(|| nvme("power_on_hours")),
         power_cycles: int(&v, "/power_cycle_count").or_else(|| nvme("power_cycles")),

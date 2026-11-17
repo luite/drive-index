@@ -472,7 +472,11 @@ pub fn print_smart_history(
             .map(|h| {
                 let r = &h.report;
                 serde_json::json!({
-                    "taken_at": h.taken_at, "passed": r.passed, "temperature_c": r.temperature_c,
+                    "taken_at": h.taken_at, "passed": r.passed, "health_source": r.health_source.as_str(),
+                    "failing_attributes": r.failing_attributes.iter()
+                        .map(|a| serde_json::json!({ "id": a.id, "name": a.name, "now": a.now, "prefail": a.prefail }))
+                        .collect::<Vec<_>>(),
+                    "temperature_c": r.temperature_c,
                     "power_on_hours": r.power_on_hours, "power_cycles": r.power_cycles,
                     "reallocated_sectors": r.reallocated_sectors, "pending_sectors": r.pending_sectors,
                     "offline_uncorrectable": r.offline_uncorrectable, "udma_crc_errors": r.udma_crc_errors,
