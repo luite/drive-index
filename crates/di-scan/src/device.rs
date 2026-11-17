@@ -26,6 +26,33 @@ use crate::run::{FsTarget, Phase, PhaseCell, ResumeMode, ScanOutcome, ScanStatus
 // takes longer, and it is where a failing drive or a flaky connection shows itself.
 // Walking everything first means such a drive still gets all its filesystems
 // catalogued before the risky reads start.
+//
+// A filesystem is not walked again if its last complete scan is younger than
+// `rescan_after_secs` (`WalkPlan::Fresh`). It is still mounted and read if it has
+// pending content work, for example because an earlier content phase was cut
+// short. Scans that start on their own when a known drive is connected use the
+// policy's --rescan-after (30 days by default); explicit scans pass 0 and walk
+// everything.
+
+/// Does a filesystem need walking? See Note [Walk first, read later].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkPlan {
+    /// Never scanned, scanned too long ago, or an interrupted scan to resume.
+    Walk,
+    /// Completely scanned at `last_scan`, recently enough to keep.
+    Fresh { last_scan: i64 },
+}
+
+/// The walk plan for filesystem `fs` at time `now`; `rescan_after_secs` 0 always walks.
+pub fn walk_plan(catalog: &Catalog, fs: i64, rescan_after_secs: i64, now: i64) -> Result<WalkPlan> {
+    if catalog.resumable_scan(fs)?.is_some() {
+        return Ok(WalkPlan::Walk);
+    }
+    Ok(match catalog.last_scanned(fs)? {
+        Some(t) if now - t < rescan_after_secs => WalkPlan::Fresh { last_scan: t },
+        _ => WalkPlan::Walk,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum After {
@@ -59,12 +86,17 @@ pub struct DeviceScanRequest {
     pub content: Option<crate::content::ContentConfig>,
     /// Read SMART health (and the real disk serial) with smartctl.
     pub smart: bool,
+    /// Don't walk filesystems completely scanned less than this long ago; 0 walks
+    /// them all. See Note [Walk first, read later].
+    pub rescan_after_secs: i64,
 }
 
 #[derive(Debug)]
 pub enum VolumeOutcome {
     /// Walked in this run (complete or interrupted: see the status).
     Scanned(Box<ScanOutcome>),
+    /// Not walked: scanned completely at `last_scan`, recently enough.
+    UpToDate { last_scan: i64 },
     Skipped(String),
     Failed(String),
 }
@@ -101,6 +133,9 @@ pub struct DeviceReport {
 pub enum Step<'a> {
     Identified { drive_id: i64, new: bool, probe: &'a DriveProbe },
     Smart(&'a Result<SmartReport, SmartUnavailable>),
+    /// Not walked again: completely scanned at `last_scan`. If `read_pending`, it is
+    /// mounted for the file contents still to be read.
+    UpToDate { vol: &'a VolumeProbe, last_scan: i64, read_pending: bool },
     Mounting(&'a VolumeProbe),
     Scanning { vol: &'a VolumeProbe, mount_point: &'a std::path::Path },
     Scanned(&'a VolumeProbe, &'a ScanOutcome),
@@ -278,6 +313,7 @@ pub fn scan_device(
         interrupted: false,
         smart,
     };
+    let now = di_core::now_secs();
 
     // Stage 1: walk every filesystem. See Note [Walk first, read later].
     // Mounted filesystems for stage 2, by index into `probe.volumes` / `report.volumes`.
@@ -290,6 +326,17 @@ pub fn scan_device(
             if control.is_cancelled() {
                 break 'outcome VolumeOutcome::Skipped("cancelled".into());
             }
+            let plan = walk_plan(&catalog, fs_id, req.rescan_after_secs, now)?;
+            if let WalkPlan::Fresh { last_scan } = plan {
+                let read_pending = match &req.content {
+                    Some(cfg) => crate::content::has_pending(catalog.conn(), fs_id, cfg)?,
+                    None => false,
+                };
+                on_step(Step::UpToDate { vol, last_scan, read_pending });
+                if !read_pending {
+                    break 'outcome VolumeOutcome::UpToDate { last_scan };
+                }
+            }
             on_step(Step::Mounting(vol));
             let mp = match di_platform::mount_ro(vol) {
                 Ok(mp) => mp,
@@ -301,18 +348,26 @@ pub fn scan_device(
             };
             catalog.update_fs_usage(fs_id, &host::fs_usage(&root), &root.display().to_string())?;
             let target = FsTarget { drive_id, filesystem_id: fs_id, root };
-            on_step(Step::Scanning { vol, mount_point: &target.root });
-            reset_progress(progress);
-            match run_fs_scan(&mut catalog, &target, &req.walk, req.resume, control, progress, phase) {
-                Ok(out) => {
-                    on_step(Step::Scanned(vol, &out));
-                    match out.status {
-                        ScanStatus::Complete => to_read.push((i, target)),
-                        ScanStatus::Interrupted => report.interrupted = true,
-                    }
-                    VolumeOutcome::Scanned(Box::new(out))
+            match plan {
+                WalkPlan::Fresh { last_scan } => {
+                    to_read.push((i, target));
+                    VolumeOutcome::UpToDate { last_scan }
                 }
-                Err(e) => VolumeOutcome::Failed(format!("{e:#}")),
+                WalkPlan::Walk => {
+                    on_step(Step::Scanning { vol, mount_point: &target.root });
+                    reset_progress(progress);
+                    match run_fs_scan(&mut catalog, &target, &req.walk, req.resume, control, progress, phase) {
+                        Ok(out) => {
+                            on_step(Step::Scanned(vol, &out));
+                            match out.status {
+                                ScanStatus::Complete => to_read.push((i, target)),
+                                ScanStatus::Interrupted => report.interrupted = true,
+                            }
+                            VolumeOutcome::Scanned(Box::new(out))
+                        }
+                        Err(e) => VolumeOutcome::Failed(format!("{e:#}")),
+                    }
+                }
             }
         };
         report.volumes.push(VolumeReport {
@@ -416,6 +471,14 @@ pub fn step_text(step: &Step, threads: usize) -> Option<String> {
         Step::Smart(Err(SmartUnavailable::NotInstalled)) => return None,
         Step::Smart(Err(SmartUnavailable::Unsupported(m))) if m.starts_with("disk images") => return None,
         Step::Smart(Err(e)) => format!("  SMART unavailable: {}", e.reason()),
+        Step::UpToDate { vol: v, last_scan, read_pending } => format!(
+            "  {} {} \"{}\": up to date (scanned {} ago){}",
+            v.dev,
+            v.fs_type,
+            v.label.as_deref().unwrap_or(""),
+            di_model::units::format_age(di_core::now_secs() - last_scan),
+            if *read_pending { "; reading the file contents still pending" } else { "" }
+        ),
         Step::Mounting(v) if v.mount_point.is_none() => {
             format!("  {} {} \"{}\": mounting read-only", v.dev, v.fs_type, v.label.as_deref().unwrap_or(""))
         }

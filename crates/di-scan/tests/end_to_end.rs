@@ -395,3 +395,28 @@ fn duplicates_and_coverage_across_drives() {
     let out = run(&b, true);
     assert_eq!(out.content.unwrap().verified, 0);
 }
+
+#[test]
+fn walk_plan_follows_the_last_complete_scan() {
+    use di_scan::device::{WalkPlan, walk_plan};
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("index.db");
+    let data = tmp.path().join("data");
+    photo_tree(&data);
+    let out = scan(&db, &data);
+    let fs = out.filesystem_id;
+    {
+        let cat = Catalog::open_readonly(&db).unwrap();
+        let now = di_core::now_secs();
+        assert_eq!(walk_plan(&cat, fs, 0, now).unwrap(), WalkPlan::Walk, "0 always walks");
+        assert!(matches!(walk_plan(&cat, fs, 3600, now).unwrap(), WalkPlan::Fresh { .. }));
+        assert_eq!(walk_plan(&cat, fs, 3600, now + 7200).unwrap(), WalkPlan::Walk, "too old");
+    }
+    // An interrupted rescan is resumed, however recent the last complete one.
+    let control = Control::default();
+    control.cancel();
+    let cut = run_dir_scan(&request(&db, &data), &control, &Progress::default(), &PhaseCell::default()).unwrap();
+    assert_eq!(cut.status, ScanStatus::Interrupted);
+    let cat = Catalog::open_readonly(&db).unwrap();
+    assert_eq!(walk_plan(&cat, fs, 3600, di_core::now_secs()).unwrap(), WalkPlan::Walk);
+}

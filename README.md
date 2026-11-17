@@ -21,8 +21,8 @@ Runs on macOS and Linux. Written in Rust.
 
 - **Hands-off scanning.** In the TUI, connecting a drive is enough. Known drives are
   recognised by their serials, WWN and partition and filesystem UUIDs, even in a different
-  enclosure, and rescanned when their last scan is older than 30 days. New drives get a
-  label prompt. `drive-index watch` does the same without a UI.
+  enclosure, and filesystems are rescanned when their last scan is older than 30 days. New
+  drives get a label prompt. `drive-index watch` does the same without a UI.
 - **Read-only, always.** Filesystems are mounted read-only (on Linux, also without journal
   replay), and nothing is ever written to a scanned drive. Drives already mounted read-write
   by the system are scanned as they are.
@@ -109,8 +109,12 @@ drive-index info                     # drives and partitions as the OS sees them
 
 Useful `scan` options: `--label NAME`, `--after eject|unmount|keep`, `--verify` (full-hash
 likely duplicates), `--no-content` (skip the metadata/hash phase), `--no-smart`, and
-`--restart` (discard an interrupted scan). Already-known drives are rescanned automatically
-when their last scan is older than `--rescan-after` (default 30 days).
+`--restart` (discard an interrupted scan). `scan` walks every filesystem of a drive; with
+`--rescan-after 1d` it skips filesystems scanned within the last day.
+
+In the TUI and `watch`, a connected known drive is scanned automatically when one of its
+filesystems was last scanned more than `--rescan-after` ago (default 30 days). Only those
+filesystems are walked again.
 
 ### The TUI
 

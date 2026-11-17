@@ -124,7 +124,52 @@ pub fn has_pending_media(conn: &Connection, fs: i64, ffprobe_available: bool) ->
     )?)
 }
 
+/// A file the content phase still has to read.
+struct PendingRow {
+    file_id: i64,
+    dir_id: i64,
+    name: Vec<u8>,
+    inode: i64,
+    kind: Option<MediaKind>,
+    want_hash: bool,
+    want_full: bool,
+}
+
+/// Does this filesystem have files the content phase would read with `cfg`?
+pub fn has_pending(conn: &Connection, fs: i64, cfg: &ContentConfig) -> Result<bool> {
+    let mut any = false;
+    select_pending(conn, fs, cfg, &mut |_| {
+        any = true;
+        false
+    })?;
+    Ok(any)
+}
+
 fn pending(conn: &Connection, fs: i64, root: &Path, cfg: &ContentConfig) -> Result<Vec<Work>> {
+    let dirs = dir_paths(conn, fs)?;
+    let mut out = Vec::new();
+    select_pending(conn, fs, cfg, &mut |p| {
+        if let Some(dir) = dirs.get(&p.dir_id) {
+            let rel = if dir.is_empty() { p.name } else { [dir.as_slice(), b"/", p.name.as_slice()].concat() };
+            out.push(Work {
+                file_id: p.file_id,
+                path: root.join(OsStr::from_bytes(&rel)),
+                kind: p.kind,
+                want_hash: p.want_hash,
+                want_full: p.want_full,
+                inode: p.inode,
+            });
+        }
+        true
+    })?;
+    // Roughly on-disk order: fewer seeks on hard disks.
+    out.sort_by_key(|w| w.inode);
+    Ok(out)
+}
+
+/// Visit the files of a filesystem that the content phase still has to read, until
+/// `visit` returns false. The one definition of "pending" (see the module docs).
+fn select_pending(conn: &Connection, fs: i64, cfg: &ContentConfig, visit: &mut dyn FnMut(PendingRow) -> bool) -> Result<()> {
     let candidate_sizes: HashSet<i64> = if cfg.hash_candidates {
         let mut stmt = conn.prepare(
             "SELECT size FROM files WHERE kind = 0 AND size >= ?1 GROUP BY size HAVING count(*) > 1",
@@ -143,7 +188,6 @@ fn pending(conn: &Connection, fs: i64, root: &Path, cfg: &ContentConfig) -> Resu
     } else {
         HashSet::new()
     };
-    let dirs = dir_paths(conn, fs)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT f.id, f.dir_id, f.name, f.name_raw, f.size, COALESCE(f.inode, 0), c.category,
                 h.file_id IS NOT NULL, m.status, m.extractor, h.quick, h.full IS NOT NULL
@@ -155,7 +199,6 @@ fn pending(conn: &Connection, fs: i64, root: &Path, cfg: &ContentConfig) -> Resu
         dup = flags::HARDLINK_DUP
     ))?;
     let mut rows = stmt.query([fs])?;
-    let mut out = Vec::new();
     while let Some(r) = rows.next()? {
         let (id, dir_id, name, raw, size, inode): (i64, i64, String, Option<Vec<u8>>, i64, i64) =
             (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?);
@@ -178,21 +221,20 @@ fn pending(conn: &Connection, fs: i64, root: &Path, cfg: &ContentConfig) -> Resu
         if !needs_media && !want_hash && !want_full {
             continue;
         }
-        let Some(dir) = dirs.get(&dir_id) else { continue };
-        let name = raw.unwrap_or_else(|| name.into_bytes());
-        let rel = if dir.is_empty() { name } else { [dir.as_slice(), b"/", name.as_slice()].concat() };
-        out.push(Work {
+        let row = PendingRow {
             file_id: id,
-            path: root.join(OsStr::from_bytes(&rel)),
+            dir_id,
+            name: raw.unwrap_or_else(|| name.into_bytes()),
+            inode,
             kind: if needs_media { kind } else { None },
             want_hash,
             want_full,
-            inode,
-        });
+        };
+        if !visit(row) {
+            break;
+        }
     }
-    // Roughly on-disk order: fewer seeks on hard disks.
-    out.sort_by_key(|w| w.inode);
-    Ok(out)
+    Ok(())
 }
 
 /// Run the content phase for one mounted filesystem. `on_start` is told how many

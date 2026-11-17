@@ -19,8 +19,8 @@ use di_platform::{Bus, DeviceEvent, DriveProbe};
 use di_walk::{Control, Progress, WalkConfig};
 
 use crate::device::{
-    After, DeviceReport, DeviceScanRequest, IdentityChoice, Step, record_drive, report_lines, scan_device, step_text,
-    to_record,
+    After, DeviceReport, DeviceScanRequest, IdentityChoice, Step, WalkPlan, record_drive, report_lines, scan_device,
+    step_text, to_record, walk_plan,
 };
 use crate::run::{PhaseCell, ResumeMode};
 
@@ -94,7 +94,8 @@ pub enum Event {
 #[derive(Debug, Clone)]
 pub enum Command {
     Scan { disk: String, identity: IdentityChoice, label: Option<String> },
-    /// Rescan and full-hash likely duplicates on the drive (making them exact).
+    /// Full-hash likely duplicates on the drive (making them exact). Filesystems
+    /// scanned within the policy's rescan interval are read, not walked again.
     Verify(String),
     Pause,
     Resume,
@@ -186,6 +187,10 @@ struct Job {
     identity: IdentityChoice,
     label: Option<String>,
     verify: bool,
+    /// Filesystems scanned more recently than this are not walked again: the policy's
+    /// value when the job started on its own, 0 when the user asked for a scan.
+    /// See Note [Walk first, read later] in di-scan:device.
+    rescan_after_secs: i64,
 }
 
 struct Active {
@@ -278,7 +283,7 @@ impl State {
                     self.log(Level::Info, format!("/dev/{disk} is already being scanned or queued."));
                 } else {
                     self.handled.insert(disk.clone());
-                    self.queue.push_back(Job { disk, identity, label, verify: false });
+                    self.queue.push_back(Job { disk, identity, label, verify: false, rescan_after_secs: 0 });
                 }
             }
             Command::Verify(disk) => {
@@ -287,8 +292,10 @@ impl State {
                     self.log(Level::Info, format!("/dev/{disk} is already being scanned or queued."));
                 } else {
                     self.handled.insert(disk.clone());
-                    self.log(Level::Info, format!("Verifying likely duplicates on /dev/{disk} (rescan + full hashes)."));
-                    self.queue.push_back(Job { disk, identity: IdentityChoice::Auto, label: None, verify: true });
+                    self.log(Level::Info, format!("Verifying likely duplicates on /dev/{disk} (full hashes)."));
+                    // Verifying needs hashes, not a new walk: up-to-date filesystems are only read.
+                    let rescan_after_secs = self.opts.policy.rescan_after_secs;
+                    self.queue.push_back(Job { disk, identity: IdentityChoice::Auto, label: None, verify: true, rescan_after_secs });
                 }
             }
             Command::Pause => {
@@ -364,7 +371,13 @@ impl State {
             let Ok(probe) = di_platform::probe(&id) else { continue };
             let (drive_id, label, outcome) = self.decide(&probe);
             if outcome == Outcome::Queued {
-                self.queue.push_back(Job { disk: id.clone(), identity: IdentityChoice::Auto, label: None, verify: false });
+                self.queue.push_back(Job {
+                    disk: id.clone(),
+                    identity: IdentityChoice::Auto,
+                    label: None,
+                    verify: false,
+                    rescan_after_secs: self.opts.policy.rescan_after_secs,
+                });
             }
             if matches!(outcome, Outcome::Ignored(_)) && !probe.is_external() {
                 continue; // internal disks: not worth an event
@@ -413,12 +426,9 @@ impl State {
                     if !vol.scannable() {
                         continue;
                     }
-                    match catalog.last_scanned(fs).ok().flatten() {
-                        Some(t) => {
-                            oldest = Some(oldest.map_or(t, |o: i64| o.min(t)));
-                            stale |= now - t >= p.rescan_after_secs;
-                        }
-                        None => stale = true,
+                    match walk_plan(&catalog, fs, p.rescan_after_secs, now) {
+                        Ok(WalkPlan::Fresh { last_scan }) => oldest = Some(oldest.map_or(last_scan, |o: i64| o.min(last_scan))),
+                        Ok(WalkPlan::Walk) | Err(_) => stale = true,
                     }
                     // Metadata still missing (first connect since the content phase
                     // existed, an interrupted phase, or ffprobe installed since).
@@ -473,6 +483,7 @@ impl State {
             allow_internal: false,
             content: Some(crate::content::ContentConfig { verify: job.verify, ..Default::default() }),
             smart: true,
+            rescan_after_secs: job.rescan_after_secs,
         };
         let (progress, phase, ev) = (self.progress.clone(), self.phase.clone(), self.ev.clone());
         let releasing = Arc::new(AtomicBool::new(false));

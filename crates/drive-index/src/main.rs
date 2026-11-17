@@ -91,6 +91,10 @@ enum Command {
         /// Drives: allow internal, non-removable disks (never the system disk)
         #[arg(long)]
         allow_internal: bool,
+        /// Drives: don't walk filesystems scanned more recently than this (e.g. 1d, 12h);
+        /// they are only read if file contents are still pending. 0 walks them all.
+        #[arg(long, default_value = "0", value_name = "AGE")]
+        rescan_after: String,
     },
     /// Interactive terminal UI (the default when run without a command in a terminal)
     Tui {
@@ -346,6 +350,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             new_drive,
             same_as,
             allow_internal,
+            rescan_after,
         } => {
             let content = (!no_content).then(|| {
                 let mut c = di_scan::content::ContentConfig::default();
@@ -376,6 +381,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     allow_internal,
                     content,
                     smart: !no_smart,
+                    rescan_after_secs: watch::parse_age(&rescan_after)?,
                 };
                 let _lock = lock::lock_or_fail(&req.catalog_path)?;
                 let session = SessionGuard::begin(&req.catalog_path, accept_stale)?;
