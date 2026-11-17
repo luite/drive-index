@@ -12,7 +12,7 @@ use plist::{Dictionary, Value};
 
 use crate::util::run;
 use crate::{
-    Bus, CMD_TIMEOUT, DeviceEvent, DriveProbe, Medium, PartitionProbe, UsbInfo, VolumeProbe,
+    Bus, CMD_TIMEOUT, DeviceEvent, DriveProbe, IdentitySource, Medium, PartitionProbe, UsbInfo, VolumeProbe,
 };
 
 // -------------------------------------------------------------------------------------
@@ -321,6 +321,12 @@ pub fn probe(dev: &str) -> Result<DriveProbe> {
     }
 
     let model = s(&chars, "Product Name").or_else(|| s(&wi, "MediaName"));
+    // A USB bridge or card reader answers for the disk with its own product name and
+    // serial. See Note [Disk facts] in di-model:identity.
+    let identity_from = match bus {
+        Bus::Usb | Bus::Sd => IdentitySource::Enclosure,
+        _ => IdentitySource::Disk,
+    };
     let raw = serde_json::json!({
         "diskutil_info": to_json(&Value::Dictionary(wi.clone())),
         "diskutil_list": to_json(&Value::Dictionary(entry.clone())),
@@ -338,6 +344,7 @@ pub fn probe(dev: &str) -> Result<DriveProbe> {
         revision: s(&chars, "Product Revision Level"),
         serial: s(&chars, "Serial Number"),
         wwn: None,
+        identity_from,
         internal: b(&wi, "Internal").unwrap_or(false),
         removable: b(&wi, "RemovableMedia").unwrap_or(false) || b(&wi, "Removable").unwrap_or(false),
         ejectable: b(&wi, "Ejectable").unwrap_or(false),

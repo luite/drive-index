@@ -1,7 +1,8 @@
 //! Drive identifiers: every identifier a probe reveals, with the
-//! strength used to recognise the drive again on a later connect or another host.
+//! strength used to recognise the drive again on a later connect or another host, and
+//! the disk facts that rule out other drives (Note [Disk facts] in di-model:identity).
 
-use crate::DriveProbe;
+use crate::{DriveProbe, IdentitySource};
 
 pub use di_model::identity::*;
 
@@ -31,9 +32,43 @@ fn is_junk_serial(s: &str) -> bool {
     lower.chars().all(|c| c == first)
 }
 
+/// Disk facts of a probed drive: its capacity, and model, serial and WWN when the disk
+/// itself reported them.
+pub fn disk_facts(d: &DriveProbe) -> DiskFacts {
+    let own = |v: &Option<String>| v.clone().filter(|_| d.identity_from == IdentitySource::Disk);
+    DiskFacts {
+        capacity_bytes: d.capacity_bytes,
+        model: own(&d.model),
+        serial: own(&d.serial).filter(|s| !is_junk_serial(s)),
+        wwn: own(&d.wwn).filter(|w| !is_junk_serial(w)),
+    }
+}
+
+/// Is a SMART reading the disk's own identify data (ATA, or NVMe through a bridge that
+/// passes commands on)? A SCSI reading through a USB bridge describes the bridge.
+fn smart_from_disk(s: &di_model::smart::SmartReport) -> bool {
+    matches!(s.protocol.as_deref(), Some("ATA" | "NVMe"))
+}
+
+/// Disk facts from SMART (capacity is left unknown).
+pub fn smart_facts(s: &di_model::smart::SmartReport) -> DiskFacts {
+    if !smart_from_disk(s) {
+        return DiskFacts::default();
+    }
+    DiskFacts {
+        capacity_bytes: 0,
+        model: s.model.clone(),
+        serial: s.serial.clone().filter(|v| !is_junk_serial(v)),
+        wwn: s.wwn.clone().filter(|w| !is_junk_serial(w)),
+    }
+}
+
 /// Identifiers of the disk itself as smartctl reports it (behind any USB bridge).
 pub fn smart_identifiers(s: &di_model::smart::SmartReport) -> Vec<Identifier> {
     let mut out = Vec::new();
+    if !smart_from_disk(s) {
+        return out;
+    }
     if let Some(w) = s.wwn.as_deref().filter(|w| !is_junk_serial(w)) {
         out.push(Identifier { kind: "wwn".into(), value: w.trim().to_ascii_lowercase(), strength: WWN });
     }
@@ -54,12 +89,16 @@ pub fn identifiers(d: &DriveProbe) -> Vec<Identifier> {
         }
     };
 
-    if let Some(w) = d.wwn.as_deref().filter(|w| !is_junk_serial(w)) {
-        push("wwn", w.to_ascii_lowercase(), WWN);
-    }
-    if let Some(s) = d.serial.as_deref().filter(|s| !is_junk_serial(s)) {
-        let model = d.model.as_deref().unwrap_or("").trim();
-        push("disk_serial", format!("{model}|{s}"), DISK_SERIAL);
+    // A bridge's own serial is shared by every disk in its enclosure: it is the
+    // usb_serial below, not a disk serial. See Note [Disk facts] in di-model:identity.
+    if d.identity_from == IdentitySource::Disk {
+        if let Some(w) = d.wwn.as_deref().filter(|w| !is_junk_serial(w)) {
+            push("wwn", w.to_ascii_lowercase(), WWN);
+        }
+        if let Some(s) = d.serial.as_deref().filter(|s| !is_junk_serial(s)) {
+            let model = d.model.as_deref().unwrap_or("").trim();
+            push("disk_serial", format!("{model}|{s}"), DISK_SERIAL);
+        }
     }
     if let Some(u) = d.ptable_uuid.as_deref() {
         push("ptable_uuid", u.to_ascii_uppercase(), PTABLE_UUID);

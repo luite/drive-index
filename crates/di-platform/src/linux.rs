@@ -10,7 +10,9 @@ use zbus::blocking::Connection;
 use zbus::blocking::fdo::ObjectManagerProxy;
 use zbus::zvariant::{OwnedValue, Value};
 
-use crate::{AuthAnswer, Bus, DeviceEvent, DriveProbe, Medium, PartitionProbe, UsbInfo, VolumeProbe};
+use crate::{
+    AuthAnswer, Bus, DeviceEvent, DriveProbe, IdentitySource, Medium, PartitionProbe, UsbInfo, VolumeProbe,
+};
 
 const DEST: &str = "org.freedesktop.UDisks2";
 const ROOT: &str = "/org/freedesktop/UDisks2";
@@ -466,6 +468,14 @@ pub fn probe(dev: &str) -> Result<DriveProbe> {
     for b in &members {
         raw_blocks.insert(o.dev_name(b).unwrap_or_default(), props_json(&o, b));
     }
+    // udev reads a disk's ATA identify data, and then reports ID_BUS=ata, also through
+    // USB bridges that pass it on. Otherwise (ID_BUS=usb) a USB disk's model and serial
+    // are the bridge's. See Note [Disk facts] in di-model:identity.
+    let identity_from = if bus == Bus::Usb && udev.get("ID_BUS").map(String::as_str) != Some("ata") {
+        IdentitySource::Enclosure
+    } else {
+        IdentitySource::Disk
+    };
     let raw = serde_json::json!({
         "drive": drive.as_deref().map(|p| props_json(&o, p)),
         "blocks": raw_blocks,
@@ -480,6 +490,7 @@ pub fn probe(dev: &str) -> Result<DriveProbe> {
         revision: o.str(d, DRIVE, "Revision"),
         serial: o.str(d, DRIVE, "Serial").or_else(|| udev.get("ID_SERIAL_SHORT").cloned()),
         wwn: o.str(d, DRIVE, "WWN").or_else(|| udev.get("ID_WWN").cloned()),
+        identity_from,
         internal: conn_bus.is_empty() && !removable && bus != Bus::Image,
         removable,
         ejectable: o.bool(d, DRIVE, "Ejectable").unwrap_or(false)

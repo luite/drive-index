@@ -167,6 +167,7 @@ pub fn to_record(p: &DriveProbe) -> DriveRecord {
         model: p.model.clone(),
         serial: p.serial.clone(),
         wwn: p.wwn.clone(),
+        disk: identity::disk_facts(p),
         firmware: p.revision.clone(),
         bus: p.bus.as_str().to_string(),
         transport_driver: p.usb.as_ref().and_then(|u| u.driver.clone()),
@@ -176,7 +177,6 @@ pub fn to_record(p: &DriveProbe) -> DriveRecord {
         usb_manufacturer: p.usb.as_ref().and_then(|u| u.manufacturer.clone()),
         usb_product: p.usb.as_ref().and_then(|u| u.product.clone()),
         usb_speed_mbps: p.usb.as_ref().and_then(|u| u.speed_mbps),
-        capacity_bytes: p.capacity_bytes,
         logical_block_size: p.logical_block_size,
         physical_block_size: p.physical_block_size,
         medium: p.medium.as_str().to_string(),
@@ -247,6 +247,11 @@ fn enrich(rec: &mut DriveRecord, s: &SmartReport) {
             rec.identifiers.push(i);
         }
     }
+    // The disk's own identity, where the OS saw only the USB bridge's.
+    let smart = identity::smart_facts(s);
+    rec.disk.model = rec.disk.model.take().or(smart.model);
+    rec.disk.serial = rec.disk.serial.take().or(smart.serial);
+    rec.disk.wwn = rec.disk.wwn.take().or(smart.wwn);
 }
 
 /// Identify a probed drive and record it (and its filesystems) in the catalog.

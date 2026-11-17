@@ -1,21 +1,25 @@
 //! Physical drives in the catalog: identity matching and records for
 //! drives, identifiers, partitions and filesystems.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rusqlite::{OptionalExtension, params};
 
 use di_model::FsUsage;
-use di_model::identity::{Identifier, MATCH_THRESHOLD, score};
+use di_model::identity::{DiskFacts, Identifier, MATCH_THRESHOLD, is_enclosure_kind, score};
 
 use crate::catalog::{Catalog, now_secs};
 
 /// Platform-neutral description of a drive, built from a device probe.
 #[derive(Debug, Clone, Default)]
 pub struct DriveRecord {
+    /// As the OS reports them: possibly the USB bridge's (see `disk` for the disk's own).
     pub vendor: Option<String>,
     pub model: Option<String>,
     pub serial: Option<String>,
     pub wwn: Option<String>,
+    /// Capacity, and the disk's own model, serial and WWN where known. See Note [Disk
+    /// facts] in di-model:identity.
+    pub disk: DiskFacts,
     pub firmware: Option<String>,
     pub bus: String,
     pub transport_driver: Option<String>,
@@ -25,7 +29,6 @@ pub struct DriveRecord {
     pub usb_manufacturer: Option<String>,
     pub usb_product: Option<String>,
     pub usb_speed_mbps: Option<u32>,
-    pub capacity_bytes: u64,
     pub logical_block_size: Option<u32>,
     pub physical_block_size: Option<u32>,
     pub medium: String,
@@ -79,6 +82,8 @@ fn i64opt<T: Into<i64>>(v: Option<T>) -> Option<i64> {
 }
 
 impl Catalog {
+    /// Which known drive `rec` is, if any. Drives whose disk facts differ from `rec`'s
+    /// are never candidates. See Note [Disk facts] in di-model:identity.
     pub fn match_drive(&self, rec: &DriveRecord) -> Result<DriveMatch> {
         let mut stmt = self
             .conn()
@@ -89,27 +94,63 @@ impl Catalog {
                 stmt.query_map(params![id.kind, id.value], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
             hits.extend(drives.into_iter().map(|d| (d, id)));
         }
-        let scores = score(hits);
+        let mut different = Vec::new();
+        for &(d, _) in &hits {
+            if !different.contains(&d) && self.drive_facts(d)?.is_some_and(|f| f.difference(&rec.disk).is_some()) {
+                different.push(d);
+            }
+        }
+        hits.retain(|(d, _)| !different.contains(d));
+        let scores = score(hits.iter().map(|&(d, id)| (d, id)));
         let Some(&(top, top_score)) = scores.first() else { return Ok(DriveMatch::New) };
         let runner_up = scores.get(1).map(|s| s.1).unwrap_or(0);
         if top_score >= MATCH_THRESHOLD && runner_up < MATCH_THRESHOLD / 2 {
             return Ok(DriveMatch::Known { drive_id: top, score: top_score, weak: false });
         }
-        if scores.len() == 1 {
+        // A single weak candidate of the same capacity is taken, unless all that links
+        // them is the enclosure: every disk swapped through one dock has that in common.
+        let beyond_enclosure = hits.iter().any(|(d, id)| *d == top && !is_enclosure_kind(&id.kind));
+        if scores.len() == 1 && beyond_enclosure {
             let capacity: Option<i64> = self
                 .conn()
                 .query_row("SELECT capacity_bytes FROM drives WHERE id = ?1", [top], |r| r.get(0))
                 .optional()?;
-            if capacity == Some(rec.capacity_bytes as i64) {
+            if capacity == Some(rec.disk.capacity_bytes as i64) {
                 return Ok(DriveMatch::Known { drive_id: top, score: top_score, weak: true });
             }
         }
         Ok(DriveMatch::Ambiguous(scores))
     }
 
+    /// The disk facts recorded for a drive (None: no such drive).
+    pub fn drive_facts(&self, drive_id: i64) -> Result<Option<DiskFacts>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT capacity_bytes, disk_model, disk_serial, disk_wwn FROM drives WHERE id = ?1",
+                [drive_id],
+                |r| {
+                    Ok(DiskFacts {
+                        capacity_bytes: r.get::<_, i64>(0)?.max(0) as u64,
+                        model: r.get(1)?,
+                        serial: r.get(2)?,
+                        wwn: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     /// Insert or update a drive and its identifiers and partitions. `label` sets the
-    /// user label (an existing label is kept when `None`).
+    /// user label (an existing label is kept when `None`). Recording a drive as an
+    /// existing one whose disk facts differ is refused (Note [Disk facts] in
+    /// di-model:identity).
     pub fn save_drive(&mut self, rec: &DriveRecord, existing: Option<i64>, label: Option<&str>) -> Result<i64> {
+        if let Some(id) = existing
+            && let Some(d) = self.drive_facts(id)?.and_then(|known| known.difference(&rec.disk))
+        {
+            bail!("this is a different disk than D{id}: its {} is {}, D{id}'s is {}", d.fact, d.other, d.this);
+        }
         let now = now_secs();
         let fingerprint = rec
             .identifiers
@@ -127,7 +168,9 @@ impl Catalog {
                         usb_manufacturer = ?13, usb_product = ?14, usb_speed_mbps = ?15, capacity_bytes = ?16,
                         logical_block_size = ?17, physical_block_size = ?18, medium = ?19, rotation_rpm = ?20,
                         removable = ?21, ptable_type = ?22, ptable_uuid = ?23, raw_info = ?24,
-                        last_seen_at = ?25, connect_count = connect_count + 1, label = COALESCE(?26, label)
+                        last_seen_at = ?25, connect_count = connect_count + 1, label = COALESCE(?26, label),
+                        disk_model = COALESCE(?27, disk_model), disk_serial = COALESCE(?28, disk_serial),
+                        disk_wwn = COALESCE(?29, disk_wwn)
                      WHERE id = ?1",
                     params![
                         id,
@@ -145,7 +188,7 @@ impl Catalog {
                         rec.usb_manufacturer,
                         rec.usb_product,
                         i64opt(rec.usb_speed_mbps),
-                        rec.capacity_bytes as i64,
+                        rec.disk.capacity_bytes as i64,
                         i64opt(rec.logical_block_size),
                         i64opt(rec.physical_block_size),
                         rec.medium,
@@ -155,7 +198,10 @@ impl Catalog {
                         rec.ptable_uuid,
                         rec.raw_info,
                         now,
-                        label
+                        label,
+                        rec.disk.model,
+                        rec.disk.serial,
+                        rec.disk.wwn
                     ],
                 )?;
                 id
@@ -166,9 +212,9 @@ impl Catalog {
                         transport_driver, usb_vendor_id, usb_product_id, usb_serial, usb_manufacturer, usb_product,
                         usb_speed_mbps, capacity_bytes, logical_block_size, physical_block_size, medium,
                         rotation_rpm, removable, ptable_type, ptable_uuid, raw_info,
-                        first_seen_at, last_seen_at, connect_count)
+                        first_seen_at, last_seen_at, connect_count, disk_model, disk_serial, disk_wwn)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                             ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?25, 1)",
+                             ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?25, 1, ?26, ?27, ?28)",
                     params![
                         fingerprint,
                         label,
@@ -185,7 +231,7 @@ impl Catalog {
                         rec.usb_manufacturer,
                         rec.usb_product,
                         i64opt(rec.usb_speed_mbps),
-                        rec.capacity_bytes as i64,
+                        rec.disk.capacity_bytes as i64,
                         i64opt(rec.logical_block_size),
                         i64opt(rec.physical_block_size),
                         rec.medium,
@@ -194,7 +240,10 @@ impl Catalog {
                         rec.ptable_type,
                         rec.ptable_uuid,
                         rec.raw_info,
-                        now
+                        now,
+                        rec.disk.model,
+                        rec.disk.serial,
+                        rec.disk.wwn
                     ],
                 )?;
                 tx.last_insert_rowid()
@@ -390,11 +439,20 @@ mod tests {
         DriveRecord {
             bus: "usb".into(),
             medium: "hdd".into(),
-            capacity_bytes: capacity,
+            disk: DiskFacts { capacity_bytes: capacity, ..Default::default() },
             identifiers: ids,
             partitions: vec![PartitionRecord { number: 1, scheme: "gpt".into(), size_bytes: capacity, ..Default::default() }],
             ..Default::default()
         }
+    }
+
+    /// A disk that reports its own model and serial.
+    fn disk(model: &str, serial: &str, capacity: u64, mut ids: Vec<Identifier>) -> DriveRecord {
+        ids.push(id("disk_serial", &format!("{model}|{serial}"), DISK_SERIAL));
+        let mut r = record(ids, capacity);
+        r.disk.model = Some(model.into());
+        r.disk.serial = Some(serial.into());
+        r
     }
 
     #[test]
@@ -416,12 +474,45 @@ mod tests {
         let card = record(vec![id("fs_uuid", "1234-ABCD", FS_UUID)], 64_000);
         let d2 = cat.save_drive(&card, None, None).unwrap();
         assert!(matches!(cat.match_drive(&card).unwrap(), DriveMatch::Known { drive_id, weak: true, .. } if drive_id == d2));
+        // Same filesystem serial, other capacity: another card.
         let other_card = record(vec![id("fs_uuid", "1234-ABCD", FS_UUID)], 32_000);
-        assert!(matches!(cat.match_drive(&other_card).unwrap(), DriveMatch::Ambiguous(_)));
+        assert_eq!(cat.match_drive(&other_card).unwrap(), DriveMatch::New);
 
-        // A clone: partition GUID of drive 1 but the serial of nothing known / of drive 2.
-        let clone = record(vec![id("fs_uuid", "AAAA", FS_UUID), id("fs_uuid", "1234-ABCD", FS_UUID)], 2_000);
+        // A clone of two drives of its size: filesystems of both.
+        let b = record(vec![id("fs_uuid", "BBBB", FS_UUID)], 2_000);
+        cat.save_drive(&b, None, None).unwrap();
+        let clone = record(vec![id("fs_uuid", "AAAA", FS_UUID), id("fs_uuid", "BBBB", FS_UUID)], 2_000);
         assert!(matches!(cat.match_drive(&clone).unwrap(), DriveMatch::Ambiguous(c) if c.len() == 2));
+    }
+
+    /// Note [Disk facts] in di-model:identity: two disks swapped through one USB dock.
+    #[test]
+    fn different_disks_in_one_dock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cat = Catalog::open(&tmp.path().join("i.db")).unwrap();
+        let dock = || id("usb_serial", "152d:0578:0000000047E5", USB_SERIAL);
+
+        let seagate = disk("ST3160023AS", "3JS2WMZV", 160_041_885_696, vec![dock(), id("ptable_uuid", "1F211F20", PTABLE_UUID)]);
+        let d1 = cat.save_drive(&seagate, None, Some("d1")).unwrap();
+
+        // Another disk in the same dock is new, and stays itself when it comes back.
+        let wd = disk("WDC WD3200JS-00PDB0", "WD-WCAPD1049006", 320_072_933_376, vec![dock(), id("ptable_uuid", "3B957C40", PTABLE_UUID)]);
+        assert_eq!(cat.match_drive(&wd).unwrap(), DriveMatch::New);
+        let d2 = cat.save_drive(&wd, None, None).unwrap();
+        assert!(matches!(cat.match_drive(&wd).unwrap(), DriveMatch::Known { drive_id, weak: false, .. } if drive_id == d2));
+        assert!(matches!(cat.match_drive(&seagate).unwrap(), DriveMatch::Known { drive_id, weak: false, .. } if drive_id == d1));
+
+        // Recording it as the other drive anyway (`--same-as`, a wrong answer) is refused.
+        let err = cat.save_drive(&wd, Some(d1), None).unwrap_err().to_string();
+        assert!(err.contains("different disk than D1") && err.contains("capacity"), "{err}");
+        let twin = disk("ST3160023AS", "5JS0XXXX", 160_041_885_696, vec![dock()]);
+        let err = cat.save_drive(&twin, Some(d1), None).unwrap_err().to_string();
+        assert!(err.contains("serial is 5JS0XXXX, D1's is 3JS2WMZV"), "{err}");
+
+        // A bridge that hides the disk: only the dock and the capacity in common. Not
+        // enough to take it for D1; the user is asked.
+        let hidden = record(vec![dock()], 160_041_885_696);
+        assert_eq!(cat.match_drive(&hidden).unwrap(), DriveMatch::Ambiguous(vec![(d1, USB_SERIAL)]));
     }
 
     #[test]

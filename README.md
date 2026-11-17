@@ -23,6 +23,9 @@ Runs on macOS and Linux. Written in Rust.
   recognised by their serials, WWN and partition and filesystem UUIDs, even in a different
   enclosure, and filesystems are rescanned when their last scan is older than 30 days. New
   drives get a label prompt. `drive-index watch` does the same without a UI.
+- **Never mixes up drives.** A drive whose capacity, model or serial differs from a known
+  drive's is never taken for it, even when both sat in the same USB dock or got the same
+  device name (`/dev/sda`, `disk4`).
 - **Read-only, always.** Filesystems are mounted read-only (on Linux, also without journal
   replay), and nothing is ever written to a scanned drive. Drives already mounted read-write
   by the system are scanned as they are.

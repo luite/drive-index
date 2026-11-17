@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::seed;
 pub use di_model::FsUsage;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub struct Catalog {
     conn: Connection,
@@ -427,6 +427,36 @@ fn migrate(conn: &Connection) -> Result<()> {
             "ALTER TABLE sessions ADD COLUMN pid INTEGER;
              ALTER TABLE sessions ADD COLUMN first_scan_id INTEGER;
              PRAGMA user_version = 2;",
+        )?;
+        tx.commit()?;
+    }
+    if version < 3 {
+        // v3: the disk's own model, serial and WWN, which rule out other drives. See
+        // Note [Disk facts] in di-model:identity. Filled in from what earlier versions
+        // stored only where it certainly came from the disk: a Linux probe that read ATA
+        // identify data (also through a USB bridge), a disk that is not behind a USB
+        // bridge (Linux SD cards: mmc, which has udev data), or an ATA/NVMe SMART reading.
+        // The rest is filled in when the drive is next seen.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE drives ADD COLUMN disk_model TEXT;
+             ALTER TABLE drives ADD COLUMN disk_serial TEXT;
+             ALTER TABLE drives ADD COLUMN disk_wwn TEXT;
+             UPDATE drives SET disk_model = model, disk_serial = serial, disk_wwn = wwn
+              WHERE bus IN ('sata', 'nvme', 'thunderbolt')
+                 OR (json_valid(raw_info) AND json_extract(raw_info, '$.udev.ID_BUS') = 'ata')
+                 OR (bus = 'sd' AND json_valid(raw_info) AND json_type(raw_info, '$.udev') IS NOT NULL);
+             CREATE TEMP TABLE smart_ids AS
+               SELECT drive_id, json_extract(raw_json, '$.model_name') AS model,
+                      json_extract(raw_json, '$.serial_number') AS serial
+                 FROM smart_snapshots s
+                WHERE json_valid(raw_json) AND json_extract(raw_json, '$.device.protocol') IN ('ATA', 'NVMe')
+                  AND taken_at = (SELECT max(taken_at) FROM smart_snapshots t WHERE t.drive_id = s.drive_id);
+             UPDATE drives SET
+                disk_model = COALESCE(disk_model, (SELECT model FROM smart_ids WHERE smart_ids.drive_id = drives.id)),
+                disk_serial = COALESCE(disk_serial, (SELECT serial FROM smart_ids WHERE smart_ids.drive_id = drives.id));
+             DROP TABLE smart_ids;
+             PRAGMA user_version = 3;",
         )?;
         tx.commit()?;
     }

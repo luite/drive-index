@@ -128,6 +128,18 @@ impl VolumeProbe {
     }
 }
 
+/// Who reported a drive's vendor, model, serial and WWN. Only what the disk reports
+/// itself identifies the disk. See Note [Disk facts] in di-model:identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentitySource {
+    /// The disk: its ATA or NVMe identify data, directly or passed on by a USB bridge.
+    Disk,
+    /// A USB bridge or card reader, reporting its own product name and serial, which
+    /// every disk or card in it shares.
+    Enclosure,
+}
+
 /// Everything known about one whole drive.
 #[derive(Debug, Clone, Serialize)]
 pub struct DriveProbe {
@@ -139,6 +151,8 @@ pub struct DriveProbe {
     pub revision: Option<String>,
     pub serial: Option<String>,
     pub wwn: Option<String>,
+    /// Where `vendor`, `model`, `serial` and `wwn` come from.
+    pub identity_from: IdentitySource,
     pub bus: Bus,
     pub internal: bool,
     pub removable: bool,
