@@ -198,7 +198,9 @@ pub fn walk(
     progress: &Progress,
     sink: &Sender<DirBatch>,
 ) -> WalkOutcome {
-    let queue = Mutex::new(Queue { stack: jobs, busy: 0, done: false });
+    // Nothing to do (a resumed scan whose directories were all listed): workers would
+    // otherwise wait for a job that never comes, since `done` is set after a job.
+    let queue = Mutex::new(Queue { done: jobs.is_empty(), stack: jobs, busy: 0 });
     let cv = Condvar::new();
     let ids = AtomicU64::new(next_id);
     let threads = cfg.threads.max(1);
@@ -544,6 +546,26 @@ mod tests {
         let err_batch = batches.iter().find(|b| b.state == DirState::Error).expect("error batch");
         assert_eq!(err_batch.errors[0].op, "readdir");
         assert_eq!(err_batch.errors[0].path, "/locked");
+    }
+
+    #[test]
+    fn nothing_to_do_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let out = walk(
+            tmp.path(),
+            None,
+            vec![],
+            2,
+            &WalkConfig::default(),
+            best_lister().as_ref(),
+            &Control::default(),
+            &Progress::default(),
+            &tx,
+        );
+        assert_eq!(out, WalkOutcome::Completed);
+        drop(tx);
+        assert_eq!(rx.iter().count(), 0);
     }
 
     #[test]
