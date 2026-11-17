@@ -26,6 +26,9 @@ Runs on macOS and Linux. Written in Rust.
 - **Read-only, always.** Filesystems are mounted read-only (on Linux, also without journal
   replay), and nothing is ever written to a scanned drive. Drives already mounted read-write
   by the system are scanned as they are.
+- **Careful with failing drives.** Every filesystem on a drive is catalogued before any file
+  contents are read. If reads start failing or hanging, drive-index stops reading and leaves
+  the rest for a later scan.
 - **Fast.** A parallel directory walker uses `getattrlistbulk` on macOS and
   `getdents64` + `statx` in inode order on Linux. Results go into a per-scan staging database
   first, so an interrupted scan (unplugged, stopped, crashed) resumes where it stopped.

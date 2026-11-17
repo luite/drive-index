@@ -420,3 +420,69 @@ fn walk_plan_follows_the_last_complete_scan() {
     let cat = Catalog::open_readonly(&db).unwrap();
     assert_eq!(walk_plan(&cat, fs, 3600, di_core::now_secs()).unwrap(), WalkPlan::Walk);
 }
+
+#[test]
+fn a_stalled_read_stops_the_content_phase() {
+    use di_scan::content::{ContentConfig, DriveTrouble, has_pending, run_content};
+    use std::os::unix::ffi::OsStrExt;
+    use std::time::{Duration, Instant};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("index.db");
+    let data = tmp.path().join("data");
+    // Duplicate candidates (same size, at least 1 MiB): each is read for a quick hash.
+    for i in 0..20 {
+        write(&data.join(format!("f{i:02}.bin")), 1 << 20);
+    }
+    let out = scan(&db, &data);
+    let fs = out.filesystem_id;
+    let cfg = ContentConfig {
+        threads: 1,
+        ffprobe: None,
+        exiftool: None,
+        stall_after: Duration::from_millis(300),
+        ..Default::default()
+    };
+    let mut cat = Catalog::open(&db).unwrap();
+    assert!(has_pending(cat.conn(), fs, &cfg).unwrap());
+
+    // The first file in read order (by inode) now blocks the reader, like a drive that
+    // stops answering: opening a FIFO waits for a writer.
+    let first: String =
+        cat.conn().query_row("SELECT name FROM files ORDER BY inode LIMIT 1", [], |r| r.get(0)).unwrap();
+    let fifo = data.canonicalize().unwrap().join(&first);
+    fs::remove_file(&fifo).unwrap();
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+    // Let the read finish well after the stall was noticed.
+    let unblock = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1500));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
+                return;
+            }
+            assert!(Instant::now() < deadline, "the reader never opened the FIFO");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    let c = run_content(&mut cat, fs, &data.canonicalize().unwrap(), &cfg, &Control::default(), &Progress::default(), &mut |_| {}).unwrap();
+    unblock.join().unwrap();
+    assert!(matches!(&c.stopped, Some(DriveTrouble::Stalled { path, .. }) if path.ends_with(&first)), "{c:?}");
+    assert_eq!(c.processed, 1, "no file is started after the stall: {c:?}");
+    assert!(!c.cancelled);
+    let content_pending: Option<i64> = cat
+        .conn()
+        .query_row("SELECT content_pending FROM scans WHERE id = ?1", [out.scan_id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(content_pending, Some(1));
+
+    // The rest is read next time.
+    assert!(has_pending(cat.conn(), fs, &cfg).unwrap());
+    let rest = run_content(&mut cat, fs, &data.canonicalize().unwrap(), &cfg, &Control::default(), &Progress::default(), &mut |_| {}).unwrap();
+    assert_eq!((rest.processed, rest.stopped), (19, None));
+    assert!(!has_pending(cat.conn(), fs, &cfg).unwrap());
+}

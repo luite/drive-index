@@ -10,16 +10,41 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use crossbeam_channel::RecvTimeoutError;
 use rusqlite::{Connection, params};
 
 use di_core::{Catalog, now_secs};
 use di_media::{Extracted, Extractor, MediaInfo, MediaKind};
 use di_model::flags;
 use di_walk::{Control, Progress};
+
+// Note [Drive trouble]
+// ~~~~~~~~~~~~~~~~~~~~
+// The content phase reads file data, and that is where a failing drive or a flaky
+// USB bridge shows itself. A read that hits trouble does not fail quickly: the kernel
+// retries it, the bridge times out after 30 s and is reset, the kernel retries again,
+// and one 64 KiB read can take minutes. With thousands of files left to read,
+// carrying on keeps a struggling drive busy for hours.
+//
+// So the phase watches for two signs of trouble:
+//
+//  * a stall: one worker has made no progress for `stall_after` (30 s). That is
+//    longer than any healthy read, including ffprobe and exiftool on large files
+//    over USB 2; a full hash counts every MiB read as progress.
+//  * repeated device errors: `max_device_errors` (3) files failed with EIO and the
+//    like (Note [Device errors] in di-walk). Per-file errors such as EACCES don't
+//    count.
+//
+// On either, the workers take no more files, and the phase ends once the reads in
+// flight return (a read blocked in the kernel cannot be abandoned). The outcome says
+// why. Files not read stay pending, since "pending" is a query, and are read by a
+// later scan. A device scan then reads no other filesystem of the same drive (see
+// Note [Walk first, read later] in di-scan:device).
 
 #[derive(Debug, Clone)]
 pub struct ContentConfig {
@@ -33,6 +58,10 @@ pub struct ContentConfig {
     /// Full-hash files whose quick hash matches another file's ("likely"
     /// duplicates), turning them into verified ("exact") duplicates.
     pub verify: bool,
+    /// Stop when one file makes no progress for this long. See Note [Drive trouble].
+    pub stall_after: Duration,
+    /// Stop after this many files failed with device errors. See Note [Drive trouble].
+    pub max_device_errors: u64,
 }
 
 impl Default for ContentConfig {
@@ -45,11 +74,31 @@ impl Default for ContentConfig {
             ffprobe: di_media::locate_tool("ffprobe"),
             exiftool: di_media::locate_tool("exiftool"),
             verify: false,
+            stall_after: Duration::from_secs(30),
+            max_device_errors: 3,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Why the content phase stopped reading from a drive. See Note [Drive trouble].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriveTrouble {
+    /// A read of `path` made no progress for `secs` seconds.
+    Stalled { path: String, secs: u64 },
+    /// `count` files failed with device errors; `last` describes the latest.
+    ReadErrors { count: u64, last: String },
+}
+
+impl DriveTrouble {
+    pub fn describe(&self) -> String {
+        match self {
+            DriveTrouble::Stalled { path, secs } => format!("a read made no progress for {secs} s ({path})"),
+            DriveTrouble::ReadErrors { count, last } => format!("{count} files failed with read errors (last: {last})"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContentOutcome {
     pub processed: u64,
     pub media: u64,
@@ -58,7 +107,60 @@ pub struct ContentOutcome {
     pub errors: u64,
     pub bytes_read: u64,
     pub cancelled: bool,
+    /// Stopped early because the drive is not reading reliably.
+    pub stopped: Option<DriveTrouble>,
     pub ms: u64,
+}
+
+impl ContentOutcome {
+    /// Files remain to be read on a later scan.
+    pub fn unfinished(&self) -> bool {
+        self.cancelled || self.stopped.is_some()
+    }
+}
+
+/// Decides when a drive is too unreliable to keep reading from. See Note [Drive trouble].
+struct TroubleMonitor {
+    stall_after: Duration,
+    max_device_errors: u64,
+    device_errors: u64,
+}
+
+impl TroubleMonitor {
+    fn new(cfg: &ContentConfig) -> Self {
+        TroubleMonitor { stall_after: cfg.stall_after, max_device_errors: cfg.max_device_errors, device_errors: 0 }
+    }
+
+    /// A file could not be read.
+    fn on_error(&mut self, e: &std::io::Error, path: &Path) -> Option<DriveTrouble> {
+        if !e.raw_os_error().is_some_and(di_walk::is_device_errno) {
+            return None;
+        }
+        self.device_errors += 1;
+        (self.device_errors >= self.max_device_errors)
+            .then(|| DriveTrouble::ReadErrors { count: self.device_errors, last: format!("{}: {e}", path.display()) })
+    }
+
+    /// A worker has been reading `path` without progress since `since`.
+    fn stalled(&self, now: Instant, since: Instant, path: &Path) -> Option<DriveTrouble> {
+        let idle = now.saturating_duration_since(since);
+        (idle >= self.stall_after).then(|| DriveTrouble::Stalled { path: path.display().to_string(), secs: idle.as_secs() })
+    }
+}
+
+/// What a worker is reading, and when it last made progress.
+struct Busy {
+    since: Instant,
+    path: PathBuf,
+}
+
+/// One file's results, from a worker to the writer.
+struct Done {
+    file_id: i64,
+    path: PathBuf,
+    extracted: std::io::Result<Extracted>,
+    /// Ok(None) when no full hash was wanted, or it was stopped midway.
+    full: std::io::Result<Option<[u8; 32]>>,
 }
 
 struct Work {
@@ -263,37 +365,43 @@ pub fn run_content(
         let _ = work_tx.send(w);
     }
     drop(work_tx);
-    type Res = (i64, std::io::Result<Extracted>, Option<[u8; 32]>);
-    let (res_tx, res_rx) = crossbeam_channel::bounded::<Res>(256);
+    let (res_tx, res_rx) = crossbeam_channel::bounded::<Done>(256);
+    // Set when the drive is in trouble: workers take no more files.
+    let halt = AtomicBool::new(false);
+    let slots: Vec<Mutex<Option<Busy>>> = (0..cfg.threads.max(1)).map(|_| Mutex::new(None)).collect();
+    let mut monitor = TroubleMonitor::new(cfg);
 
     std::thread::scope(|s| -> Result<()> {
-        for _ in 0..cfg.threads.max(1) {
-            let (work_rx, res_tx) = (work_rx.clone(), res_tx.clone());
+        for slot in &slots {
+            let (work_rx, res_tx, halt) = (work_rx.clone(), res_tx.clone(), &halt);
             s.spawn(move || {
                 let mut ex = Extractor::new(cfg.ffprobe.clone(), cfg.exiftool.clone());
+                let stop = || control.is_cancelled() || halt.load(Ordering::Relaxed);
                 while let Ok(w) = work_rx.recv() {
-                    while control.is_paused() && !control.is_cancelled() {
+                    while control.is_paused() && !stop() {
                         std::thread::sleep(Duration::from_millis(50));
                     }
-                    if control.is_cancelled() {
+                    if stop() {
                         break;
                     }
                     progress.set_current(&w.path.to_string_lossy());
-                    let r = if w.kind.is_some() || w.want_hash {
+                    *slot.lock().unwrap() = Some(Busy { since: Instant::now(), path: w.path.clone() });
+                    let extracted = if w.kind.is_some() || w.want_hash {
                         ex.extract(&w.path, w.kind, w.want_hash)
                     } else {
                         Ok(Extracted { quick_hash: None, media: None, bytes_read: 0 })
                     };
-                    let full = if w.want_full && r.is_ok() {
-                        di_media::full_hash(&w.path, &|| control.is_cancelled(), &|n| {
+                    let full = match &extracted {
+                        Ok(_) if w.want_full => di_media::full_hash(&w.path, &stop, &|n| {
                             progress.content_bytes.fetch_add(n, Ordering::Relaxed);
-                        })
-                        .ok()
-                        .flatten()
-                    } else {
-                        None
+                            if let Some(b) = slot.lock().unwrap().as_mut() {
+                                b.since = Instant::now();
+                            }
+                        }),
+                        _ => Ok(None),
                     };
-                    if res_tx.send((w.file_id, r, full)).is_err() {
+                    *slot.lock().unwrap() = None;
+                    if res_tx.send(Done { file_id: w.file_id, path: w.path, extracted, full }).is_err() {
                         break;
                     }
                 }
@@ -301,40 +409,69 @@ pub fn run_content(
         }
         drop(res_tx);
 
-        // Single writer: batched transactions.
+        // Single writer: batched transactions. It also watches for drive trouble.
         let conn = catalog.conn_mut();
         let mut tx = conn.transaction()?;
         let mut in_tx = 0usize;
         let mut last = Instant::now();
-        for (file_id, r, full) in res_rx.iter() {
-            progress.content_done.fetch_add(1, Ordering::Relaxed);
-            outcome.processed += 1;
-            match r {
-                Ok(e) => {
-                    progress.content_bytes.fetch_add(e.bytes_read, Ordering::Relaxed);
-                    outcome.bytes_read += e.bytes_read;
-                    if let Some(h) = e.quick_hash {
-                        tx.execute(
-                            "INSERT INTO file_hashes (file_id, quick, full, hashed_at) VALUES (?1, ?2, NULL, ?3)
-                             ON CONFLICT (file_id) DO UPDATE SET quick = excluded.quick, hashed_at = excluded.hashed_at",
-                            params![file_id, h.as_slice(), now_secs()],
-                        )?;
-                        outcome.hashed += 1;
-                    }
-                    if let Some(m) = &e.media {
-                        save_media(&tx, file_id, m)?;
-                        outcome.media += 1;
-                    }
-                    if let Some(full) = full {
-                        tx.execute("UPDATE file_hashes SET full = ?2 WHERE file_id = ?1", params![file_id, full.as_slice()])?;
-                        outcome.verified += 1;
+        loop {
+            match res_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(d) => {
+                    progress.content_done.fetch_add(1, Ordering::Relaxed);
+                    outcome.processed += 1;
+                    in_tx += 1;
+                    // Unreadable now (permissions, unplugged): not recorded, retried next time.
+                    let mut failed = |e: &std::io::Error, outcome: &mut ContentOutcome| {
+                        outcome.errors += 1;
+                        let t = monitor.on_error(e, &d.path);
+                        if outcome.stopped.is_none() {
+                            outcome.stopped = t;
+                        }
+                    };
+                    match &d.extracted {
+                        Ok(e) => {
+                            progress.content_bytes.fetch_add(e.bytes_read, Ordering::Relaxed);
+                            outcome.bytes_read += e.bytes_read;
+                            if let Some(h) = e.quick_hash {
+                                tx.execute(
+                                    "INSERT INTO file_hashes (file_id, quick, full, hashed_at) VALUES (?1, ?2, NULL, ?3)
+                                     ON CONFLICT (file_id) DO UPDATE SET quick = excluded.quick, hashed_at = excluded.hashed_at",
+                                    params![d.file_id, h.as_slice(), now_secs()],
+                                )?;
+                                outcome.hashed += 1;
+                            }
+                            if let Some(m) = &e.media {
+                                save_media(&tx, d.file_id, m)?;
+                                outcome.media += 1;
+                            }
+                            match &d.full {
+                                Ok(Some(full)) => {
+                                    tx.execute(
+                                        "UPDATE file_hashes SET full = ?2 WHERE file_id = ?1",
+                                        params![d.file_id, full.as_slice()],
+                                    )?;
+                                    outcome.verified += 1;
+                                }
+                                Ok(None) => {}
+                                Err(e) => failed(e, &mut outcome),
+                            }
+                        }
+                        Err(e) => failed(e, &mut outcome),
                     }
                 }
-                // Unreadable now (permissions, unplugged): not recorded, retried next time.
-                Err(_) => outcome.errors += 1,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
             }
-            in_tx += 1;
-            if in_tx >= 500 || last.elapsed() >= Duration::from_millis(500) {
+            if outcome.stopped.is_none() {
+                let now = Instant::now();
+                outcome.stopped = slots
+                    .iter()
+                    .find_map(|s| s.lock().unwrap().as_ref().and_then(|b| monitor.stalled(now, b.since, &b.path)));
+            }
+            if outcome.stopped.is_some() {
+                halt.store(true, Ordering::Relaxed);
+            }
+            if in_tx > 0 && (in_tx >= 500 || last.elapsed() >= Duration::from_millis(500)) {
                 tx.commit()?;
                 tx = conn.transaction()?;
                 in_tx = 0;
@@ -351,7 +488,7 @@ pub fn run_content(
         "UPDATE scans SET hashed_quick = hashed_quick + ?2, media_extracted = media_extracted + ?3,
                 content_pending = CASE WHEN ?4 THEN 1 ELSE NULL END
          WHERE id = (SELECT current_scan_id FROM filesystems WHERE id = ?1)",
-        params![fs, outcome.hashed as i64, outcome.media as i64, outcome.cancelled],
+        params![fs, outcome.hashed as i64, outcome.media as i64, outcome.unfinished()],
     )?;
     Ok(outcome)
 }
@@ -434,4 +571,42 @@ fn save_media(conn: &Connection, file_id: i64, m: &MediaInfo) -> Result<()> {
         ])?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn monitor(max_device_errors: u64) -> TroubleMonitor {
+        TroubleMonitor { stall_after: Duration::from_secs(30), max_device_errors, device_errors: 0 }
+    }
+
+    #[test]
+    fn device_errors_stop_reading_but_file_errors_do_not() {
+        let mut m = monitor(3);
+        let p = Path::new("/x/a.db");
+        let os = std::io::Error::from_raw_os_error;
+        for _ in 0..10 {
+            assert_eq!(m.on_error(&os(libc::EACCES), p), None);
+            assert_eq!(m.on_error(&os(libc::ENOENT), p), None);
+        }
+        assert_eq!(m.on_error(&std::io::Error::other("read cap exceeded"), p), None);
+        assert_eq!(m.on_error(&os(libc::EIO), p), None);
+        assert_eq!(m.on_error(&os(libc::ENODEV), p), None);
+        let t = m.on_error(&os(libc::EIO), p).expect("third device error");
+        assert!(matches!(t, DriveTrouble::ReadErrors { count: 3, .. }), "{t:?}");
+        assert!(t.describe().contains("/x/a.db"), "{}", t.describe());
+    }
+
+    #[test]
+    fn a_stall_is_time_without_progress() {
+        let m = monitor(3);
+        let now = Instant::now();
+        let ago = |s| now.checked_sub(Duration::from_secs(s)).unwrap();
+        let p = Path::new("/x/b.a");
+        assert_eq!(m.stalled(now, ago(29), p), None);
+        assert_eq!(m.stalled(now, ago(31), p), Some(DriveTrouble::Stalled { path: "/x/b.a".into(), secs: 31 }));
+        // Progress after the stall was noticed (clock order) is not a stall.
+        assert_eq!(m.stalled(ago(1), now, p), None);
+    }
 }

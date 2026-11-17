@@ -11,7 +11,7 @@ use di_model::smart::{SmartReport, SmartUnavailable};
 use di_platform::{DriveProbe, VolumeProbe, identity};
 use di_walk::{Control, Progress, WalkConfig, host};
 
-use crate::content::ContentOutcome;
+use crate::content::{ContentOutcome, DriveTrouble};
 use crate::run::{FsTarget, Phase, PhaseCell, ResumeMode, ScanOutcome, ScanStatus, run_fs_scan};
 
 // Note [Walk first, read later]
@@ -23,9 +23,11 @@ use crate::run::{FsTarget, Phase, PhaseCell, ResumeMode, ScanOutcome, ScanStatus
 //
 // The walk reads little (directories and inodes) and produces most of the value: a
 // complete list of names, sizes and dates. The content phase reads file data. It
-// takes longer, and it is where a failing drive or a flaky connection shows itself.
-// Walking everything first means such a drive still gets all its filesystems
-// catalogued before the risky reads start.
+// takes longer, and it is where a failing drive or a flaky connection shows itself
+// (Note [Drive trouble] in di-scan:content). Walking everything first means such a
+// drive still gets all its filesystems catalogued before the risky reads start. Once
+// one filesystem's reads run into drive trouble, the others are not read either;
+// their files stay pending for a later scan.
 //
 // A filesystem is not walked again if its last complete scan is younger than
 // `rescan_after_secs` (`WalkPlan::Fresh`). It is still mounted and read if it has
@@ -125,6 +127,8 @@ pub struct DeviceReport {
     pub unmounted: bool,
     pub ejected: bool,
     pub interrupted: bool,
+    /// Reading file contents stopped because the drive is not reading reliably.
+    pub trouble: Option<DriveTrouble>,
     pub smart: Option<Result<SmartReport, SmartUnavailable>>,
 }
 
@@ -311,6 +315,7 @@ pub fn scan_device(
         unmounted: false,
         ejected: false,
         interrupted: false,
+        trouble: None,
         smart,
     };
     let now = di_core::now_secs();
@@ -384,7 +389,7 @@ pub fn scan_device(
     // Stage 2: read file contents of the filesystems mounted above.
     if let Some(cfg) = &req.content {
         for (i, target) in &to_read {
-            if control.is_cancelled() {
+            if report.trouble.is_some() || control.is_cancelled() {
                 break;
             }
             let vol = &probe.volumes[*i];
@@ -394,6 +399,7 @@ pub fn scan_device(
                 Ok(c) => {
                     on_step(Step::ContentDone(vol, &c));
                     report.interrupted |= c.cancelled;
+                    report.trouble = c.stopped.clone();
                     report.volumes[*i].content = Some(c);
                 }
                 Err(e) => report.volumes[*i].outcome = VolumeOutcome::Failed(format!("content phase: {e:#}")),
@@ -403,6 +409,8 @@ pub fn scan_device(
     }
 
     // Leave the drive mounted if anything is unfinished, so the user can look or resume.
+    // Drive trouble does not count: the walk is complete, and the files left to read
+    // wait for a later scan whether the drive stays mounted or not.
     let all_done = !report.interrupted
         && report.volumes.iter().all(|v| !matches!(v.outcome, VolumeOutcome::Failed(_)));
     if all_done && req.after != After::KeepMounted {
@@ -516,6 +524,8 @@ pub fn step_text(step: &Step, threads: usize) -> Option<String> {
             }
             if c.cancelled {
                 t.push_str("; stopped (continues next time)");
+            } else if c.stopped.is_some() {
+                t.push_str("; stopped early, the drive is not reading reliably (the rest is read next time)");
             }
             if c.processed == 0 {
                 return None;
@@ -537,6 +547,12 @@ pub fn report_lines(r: &DeviceReport) -> Vec<String> {
             VolumeOutcome::Failed(e) => out.push(format!("  {} {}: FAILED — {e}", v.dev, v.fs_type)),
             _ => {}
         }
+    }
+    if let Some(t) = &r.trouble {
+        out.push(format!(
+            "  ⚠ the drive is not reading reliably: {}. Stopped reading file contents; the rest is read on a later scan.",
+            t.describe()
+        ));
     }
     if r.weak_match {
         out.push(format!(

@@ -17,3 +17,20 @@ pub use walk::{
     Control, DirBatch, DirJob, DirRow, DirState, ErrorRow, FileRow, Progress, WalkConfig,
     WalkOutcome, walk,
 };
+
+// Note [Device errors]
+// ~~~~~~~~~~~~~~~~~~~~
+// Some errnos say nothing about the file and everything about the drive under it:
+// the device failed a read (EIO), went away (ENODEV, ENXIO) or stopped answering
+// (ETIMEDOUT). A drive that is unplugged mid-scan, or whose USB bridge resets,
+// produces a burst of them. They are treated differently from per-file errors
+// (EACCES, ENOENT, ELOOP, ...):
+//
+//  * the content phase stops reading from a drive that keeps failing reads
+//    (see Note [Drive trouble] in di-scan:content).
+
+/// Is this errno a failure of the device rather than of one file?
+/// See Note [Device errors].
+pub fn is_device_errno(errno: i32) -> bool {
+    matches!(errno, libc::EIO | libc::ENXIO | libc::ENODEV | libc::ETIMEDOUT)
+}
