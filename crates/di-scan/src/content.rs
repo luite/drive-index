@@ -195,7 +195,8 @@ fn pending(conn: &Connection, fs: i64, root: &Path, cfg: &ContentConfig) -> Resu
     Ok(out)
 }
 
-/// Run the content phase for one mounted filesystem.
+/// Run the content phase for one mounted filesystem. `on_start` is told how many
+/// files will be read, once, before reading starts (not at all if there are none).
 pub fn run_content(
     catalog: &mut Catalog,
     fs: i64,
@@ -203,6 +204,7 @@ pub fn run_content(
     cfg: &ContentConfig,
     control: &Control,
     progress: &Progress,
+    on_start: &mut dyn FnMut(u64),
 ) -> Result<ContentOutcome> {
     let start = Instant::now();
     let work = pending(catalog.conn(), fs, root, cfg)?;
@@ -212,6 +214,7 @@ pub fn run_content(
     if work.is_empty() {
         return Ok(outcome);
     }
+    on_start(work.len() as u64);
 
     let (work_tx, work_rx) = crossbeam_channel::unbounded::<Work>();
     for w in work {

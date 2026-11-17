@@ -112,7 +112,7 @@ pub fn run_dir_scan(req: &ScanRequest, control: &Control, progress: &Progress, p
     let mut out = run_fs_scan(&mut catalog, &target, &req.walk, req.resume, control, progress, phase)?;
     if let (ScanStatus::Complete, Some(cfg)) = (out.status, &req.content) {
         phase.set(Phase::Content);
-        out.content = Some(run_content(&mut catalog, target.filesystem_id, &target.root, cfg, control, progress)?);
+        out.content = Some(run_content(&mut catalog, target.filesystem_id, &target.root, cfg, control, progress, &mut |_| {})?);
         phase.set(Phase::Done);
     }
     Ok(out)

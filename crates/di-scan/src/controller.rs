@@ -486,11 +486,23 @@ impl State {
                     if matches!(step, Step::Unmounting | Step::Ejecting) {
                         rel.store(true, Ordering::SeqCst);
                     }
-                    if let Step::Scanning { vol, mount_point } = &step {
-                        if let Some(j) = view.lock().unwrap().as_mut() {
-                            j.volume = Some(format!("{} {} \"{}\"", vol.dev, vol.fs_type, vol.label.as_deref().unwrap_or("")));
-                            j.expected_bytes = di_walk::host::fs_usage(mount_point).used_bytes;
+                    let name = |vol: &di_platform::VolumeProbe| {
+                        format!("{} {} \"{}\"", vol.dev, vol.fs_type, vol.label.as_deref().unwrap_or(""))
+                    };
+                    match &step {
+                        Step::Scanning { vol, mount_point } => {
+                            if let Some(j) = view.lock().unwrap().as_mut() {
+                                j.volume = Some(name(vol));
+                                j.expected_bytes = di_walk::host::fs_usage(mount_point).used_bytes;
+                            }
                         }
+                        // Contents are read after all walks: the volume changes again.
+                        Step::Content { vol, .. } => {
+                            if let Some(j) = view.lock().unwrap().as_mut() {
+                                j.volume = Some(name(vol));
+                            }
+                        }
+                        _ => {}
                     }
                     if let Some(text) = step_text(&step, threads) {
                         let _ = ev.send(Event::JobStep { disk: disk.clone(), text });

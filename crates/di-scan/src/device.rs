@@ -1,9 +1,9 @@
-//! Scanning a whole drive: probe → identify → record → mount each
-//! filesystem read-only → scan → unmount → eject.
+//! Scanning a whole drive: probe → identify → record → mount each filesystem
+//! read-only and walk it → read file contents → unmount → eject.
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 use di_core::Catalog;
 use di_core::drives::{DriveMatch, DriveRecord, FsRecord, PartitionRecord};
@@ -11,7 +11,21 @@ use di_model::smart::{SmartReport, SmartUnavailable};
 use di_platform::{DriveProbe, VolumeProbe, identity};
 use di_walk::{Control, Progress, WalkConfig, host};
 
-use crate::run::{FsTarget, PhaseCell, ResumeMode, ScanOutcome, ScanStatus, run_fs_scan};
+use crate::content::ContentOutcome;
+use crate::run::{FsTarget, Phase, PhaseCell, ResumeMode, ScanOutcome, ScanStatus, run_fs_scan};
+
+// Note [Walk first, read later]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// A device scan has two stages, each over all of the drive's filesystems:
+//
+//  1. walk: mount each filesystem and record its directory tree and metadata;
+//  2. read: run the content phase (media metadata, hashes) on each of them.
+//
+// The walk reads little (directories and inodes) and produces most of the value: a
+// complete list of names, sizes and dates. The content phase reads file data. It
+// takes longer, and it is where a failing drive or a flaky connection shows itself.
+// Walking everything first means such a drive still gets all its filesystems
+// catalogued before the risky reads start.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum After {
@@ -49,6 +63,7 @@ pub struct DeviceScanRequest {
 
 #[derive(Debug)]
 pub enum VolumeOutcome {
+    /// Walked in this run (complete or interrupted: see the status).
     Scanned(Box<ScanOutcome>),
     Skipped(String),
     Failed(String),
@@ -63,6 +78,8 @@ pub struct VolumeReport {
     /// Mounted read-write by the OS before we started (scanned as-is).
     pub was_mounted_rw: bool,
     pub outcome: VolumeOutcome,
+    /// The content phase, if it ran for this filesystem.
+    pub content: Option<ContentOutcome>,
 }
 
 #[derive(Debug)]
@@ -87,9 +104,9 @@ pub enum Step<'a> {
     Mounting(&'a VolumeProbe),
     Scanning { vol: &'a VolumeProbe, mount_point: &'a std::path::Path },
     Scanned(&'a VolumeProbe, &'a ScanOutcome),
-    /// Content phase starting for a volume.
-    Content(&'a VolumeProbe),
-    ContentDone(&'a VolumeProbe, &'a crate::content::ContentOutcome),
+    /// Content phase starting for a volume, with this many files to read.
+    Content { vol: &'a VolumeProbe, files: u64 },
+    ContentDone(&'a VolumeProbe, &'a ContentOutcome),
     Unmounting,
     Ejecting,
 }
@@ -262,66 +279,72 @@ pub fn scan_device(
         smart,
     };
 
-    for (vol, &fs_id) in probe.volumes.iter().zip(&fs_ids) {
-        let mut vr = VolumeReport {
+    // Stage 1: walk every filesystem. See Note [Walk first, read later].
+    // Mounted filesystems for stage 2, by index into `probe.volumes` / `report.volumes`.
+    let mut to_read: Vec<(usize, FsTarget)> = Vec::new();
+    for (i, (vol, &fs_id)) in probe.volumes.iter().zip(&fs_ids).enumerate() {
+        let outcome = 'outcome: {
+            if let Some(reason) = &vol.unscannable_reason {
+                break 'outcome VolumeOutcome::Skipped(reason.clone());
+            }
+            if control.is_cancelled() {
+                break 'outcome VolumeOutcome::Skipped("cancelled".into());
+            }
+            on_step(Step::Mounting(vol));
+            let mp = match di_platform::mount_ro(vol) {
+                Ok(mp) => mp,
+                Err(e) => break 'outcome VolumeOutcome::Failed(format!("{e:#}")),
+            };
+            let root = match mp.canonicalize() {
+                Ok(r) => r,
+                Err(e) => break 'outcome VolumeOutcome::Failed(format!("mount point {}: {e}", mp.display())),
+            };
+            catalog.update_fs_usage(fs_id, &host::fs_usage(&root), &root.display().to_string())?;
+            let target = FsTarget { drive_id, filesystem_id: fs_id, root };
+            on_step(Step::Scanning { vol, mount_point: &target.root });
+            reset_progress(progress);
+            match run_fs_scan(&mut catalog, &target, &req.walk, req.resume, control, progress, phase) {
+                Ok(out) => {
+                    on_step(Step::Scanned(vol, &out));
+                    match out.status {
+                        ScanStatus::Complete => to_read.push((i, target)),
+                        ScanStatus::Interrupted => report.interrupted = true,
+                    }
+                    VolumeOutcome::Scanned(Box::new(out))
+                }
+                Err(e) => VolumeOutcome::Failed(format!("{e:#}")),
+            }
+        };
+        report.volumes.push(VolumeReport {
             dev: vol.dev.clone(),
             fs_type: vol.fs_type.clone(),
             label: vol.label.clone(),
             filesystem_id: fs_id,
             was_mounted_rw: vol.mounted_writable == Some(true),
-            outcome: VolumeOutcome::Skipped(String::new()),
-        };
-        if let Some(reason) = &vol.unscannable_reason {
-            vr.outcome = VolumeOutcome::Skipped(reason.clone());
-            report.volumes.push(vr);
-            continue;
-        }
-        if control.is_cancelled() {
-            vr.outcome = VolumeOutcome::Skipped("cancelled".into());
-            report.volumes.push(vr);
-            continue;
-        }
-        on_step(Step::Mounting(vol));
-        let mp = match di_platform::mount_ro(vol) {
-            Ok(mp) => mp,
-            Err(e) => {
-                vr.outcome = VolumeOutcome::Failed(format!("{e:#}"));
-                report.volumes.push(vr);
-                continue;
+            outcome,
+            content: None,
+        });
+    }
+
+    // Stage 2: read file contents of the filesystems mounted above.
+    if let Some(cfg) = &req.content {
+        for (i, target) in &to_read {
+            if control.is_cancelled() {
+                break;
             }
-        };
-        let root = mp.canonicalize().with_context(|| format!("mount point {}", mp.display()))?;
-        catalog.update_fs_usage(fs_id, &host::fs_usage(&root), &root.display().to_string())?;
-        on_step(Step::Scanning { vol, mount_point: &root });
-        reset_progress(progress);
-        let target = FsTarget { drive_id, filesystem_id: fs_id, root };
-        match run_fs_scan(&mut catalog, &target, &req.walk, req.resume, control, progress, phase) {
-            Ok(mut out) => {
-                on_step(Step::Scanned(vol, &out));
-                if out.status == ScanStatus::Interrupted {
-                    report.interrupted = true;
-                } else if let Some(cfg) = &req.content {
-                    on_step(Step::Content(vol));
-                    phase.set(crate::run::Phase::Content);
-                    match crate::content::run_content(&mut catalog, fs_id, &target.root, cfg, control, progress) {
-                        Ok(c) => {
-                            on_step(Step::ContentDone(vol, &c));
-                            if c.cancelled {
-                                report.interrupted = true;
-                            }
-                            out.content = Some(c);
-                        }
-                        Err(e) => vr.outcome = VolumeOutcome::Failed(format!("content phase: {e:#}")),
-                    }
-                    phase.set(crate::run::Phase::Done);
+            let vol = &probe.volumes[*i];
+            phase.set(Phase::Content);
+            let mut started = |files| on_step(Step::Content { vol, files });
+            match crate::content::run_content(&mut catalog, target.filesystem_id, &target.root, cfg, control, progress, &mut started) {
+                Ok(c) => {
+                    on_step(Step::ContentDone(vol, &c));
+                    report.interrupted |= c.cancelled;
+                    report.volumes[*i].content = Some(c);
                 }
-                if !matches!(vr.outcome, VolumeOutcome::Failed(_)) {
-                    vr.outcome = VolumeOutcome::Scanned(Box::new(out));
-                }
+                Err(e) => report.volumes[*i].outcome = VolumeOutcome::Failed(format!("content phase: {e:#}")),
             }
-            Err(e) => vr.outcome = VolumeOutcome::Failed(format!("{e:#}")),
+            phase.set(Phase::Done);
         }
-        report.volumes.push(vr);
     }
 
     // Leave the drive mounted if anything is unfinished, so the user can look or resume.
@@ -407,7 +430,12 @@ pub fn step_text(step: &Step, threads: usize) -> Option<String> {
             ScanStatus::Complete => format!("  {}: {}", v.dev, describe_outcome(out, threads)),
             ScanStatus::Interrupted => format!("  {}: interrupted (resumes next time)", v.dev),
         },
-        Step::Content(v) => format!("  {}: reading metadata and quick hashes…", v.dev),
+        Step::Content { vol, files } => format!(
+            "  {}: reading {} {} for metadata and hashes…",
+            vol.dev,
+            di_model::units::format_count(*files),
+            if *files == 1 { "file" } else { "files" }
+        ),
         Step::ContentDone(v, c) => {
             let mut t = format!(
                 "  {}: {} files read ({} with metadata, {} hashed) in {}",
