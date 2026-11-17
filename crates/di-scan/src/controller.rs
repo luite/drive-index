@@ -2,6 +2,9 @@
 //! applies the policy, queues and runs device scans one at a time, and executes
 //! commands from a front end (TUI or the headless `watch`). Front ends receive
 //! [`Event`]s and read live progress from the shared counters.
+//!
+//! Disks are tracked as attachments ([`DiskRef`]), never by device name alone: see
+//! Note [Disks are not their names] in di-platform.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -15,12 +18,12 @@ use anyhow::Result;
 
 use di_core::Catalog;
 use di_core::drives::DriveMatch;
-use di_platform::{Bus, DeviceEvent, DriveProbe};
+use di_platform::{Bus, DeviceEvent, DiskRef, DriveProbe};
 use di_walk::{Control, Progress, WalkConfig};
 
 use crate::device::{
-    After, DeviceReport, DeviceScanRequest, IdentityChoice, Step, WalkPlan, record_drive, report_lines, scan_device,
-    step_text, to_record, unscannable_summary, walk_plan,
+    After, DeviceReport, DeviceScanRequest, DiskTarget, IdentityChoice, Step, WalkPlan, record_drive, report_lines,
+    scan_device, step_text, to_record, unscannable_summary, walk_plan,
 };
 use crate::run::{PhaseCell, ResumeMode};
 
@@ -97,31 +100,34 @@ pub enum Outcome {
 #[derive(Debug)]
 pub enum Event {
     Log { level: Level, text: String },
-    Attached { disk: String, probe: Box<DriveProbe>, drive_id: Option<i64>, label: Option<String>, outcome: Outcome },
-    Detached { disk: String, expected: bool },
-    JobStarted { disk: String },
-    JobStep { disk: String, text: String },
-    JobFinished { disk: String, result: std::result::Result<Box<DeviceReport>, String> },
+    Attached { disk: DiskRef, probe: Box<DriveProbe>, drive_id: Option<i64>, label: Option<String>, outcome: Outcome },
+    /// The disk is gone; `expected` when we unmounted or ejected it ourselves.
+    Detached { disk: DiskRef, expected: bool },
+    JobStarted { disk: DiskRef },
+    JobStep { disk: DiskRef, text: String },
+    JobFinished { disk: DiskRef, result: std::result::Result<Box<DeviceReport>, String> },
 }
 
+/// Commands name the attachment they were decided for; one whose disk has been
+/// disconnected since is refused, even if another disk now has its name.
 #[derive(Debug, Clone)]
 pub enum Command {
-    Scan { disk: String, identity: IdentityChoice, label: Option<String> },
+    Scan { disk: DiskRef, identity: IdentityChoice, label: Option<String> },
     /// Full-hash likely duplicates on the drive (making them exact). Filesystems
     /// scanned within the policy's rescan interval are read, not walked again.
-    Verify(String),
+    Verify(DiskRef),
     Pause,
     Resume,
     Cancel,
-    Unmount(String),
-    Eject(String),
+    Unmount(DiskRef),
+    Eject(DiskRef),
     Shutdown,
 }
 
 /// The running job, as seen by front ends.
 #[derive(Debug, Clone)]
 pub struct JobView {
-    pub disk: String,
+    pub disk: DiskRef,
     pub started: Instant,
     pub control: Arc<Control>,
     /// Volume being scanned right now (`disk4s2 exfat "SamsungUSB"`).
@@ -196,7 +202,7 @@ impl Drop for Controller {
 }
 
 struct Job {
-    disk: String,
+    disk: DiskRef,
     identity: IdentityChoice,
     label: Option<String>,
     verify: bool,
@@ -207,7 +213,7 @@ struct Job {
 }
 
 struct Active {
-    disk: String,
+    disk: DiskRef,
     control: Arc<Control>,
     releasing: Arc<AtomicBool>,
     handle: JoinHandle<Result<DeviceReport>>,
@@ -219,11 +225,14 @@ struct State {
     progress: Arc<Progress>,
     phase: Arc<PhaseCell>,
     job: Arc<Mutex<Option<JobView>>>,
+    /// Names with recent device events, until things settle.
     pending: HashMap<String, Instant>,
-    handled: HashSet<String>,
+    /// Attachments decided on and reported to the front end, until they go away.
+    handled: HashSet<DiskRef>,
     queue: VecDeque<Job>,
     active: Option<Active>,
-    released: HashSet<String>,
+    /// Attachments we unmounted or ejected ourselves.
+    released: HashSet<DiskRef>,
     shutting_down: bool,
 }
 
@@ -258,51 +267,73 @@ impl State {
 
     fn on_device(&mut self, e: DeviceEvent) {
         match e {
-            DeviceEvent::Appeared(d) => {
-                self.released.remove(&d);
-                self.pending.insert(d, Instant::now());
+            DeviceEvent::Appeared(name) => {
+                self.pending.insert(name, Instant::now());
             }
-            DeviceEvent::Disappeared(d) => {
-                self.pending.remove(&d);
-                self.queue.retain(|j| j.disk != d);
-                let was_handled = self.handled.remove(&d);
-                match self.active.as_ref().filter(|a| a.disk == d) {
-                    Some(a) if a.releasing.load(Ordering::SeqCst) => {
-                        // Our own unmount/eject at the end of the scan.
-                        self.released.insert(d.clone());
-                        let _ = self.ev.send(Event::Detached { disk: d, expected: true });
-                    }
-                    Some(a) => {
-                        if !a.control.is_cancelled() {
-                            a.control.cancel();
-                            self.log(Level::Warn, format!("/dev/{d} was removed during the scan; it will resume next time."));
-                        }
-                    }
-                    None if was_handled => {
-                        let expected = self.released.contains(&d);
-                        let _ = self.ev.send(Event::Detached { disk: d, expected });
-                    }
-                    None => {}
+            DeviceEvent::Disappeared(name) => {
+                // The event names a disk, not an attachment. If a disk is at that name
+                // now, it may be ours (only a partition went) or a new one.
+                let now = di_platform::resolve_whole(&name).ok();
+                if now.is_none() {
+                    self.pending.remove(&name);
                 }
+                self.forget_gone(&name, now.as_ref());
             }
         }
     }
 
+    /// Forget every attachment at `name` except `now` (the one there now, if any):
+    /// those disks were disconnected, reported or not.
+    fn forget_gone(&mut self, name: &str, now: Option<&DiskRef>) {
+        let gone = |r: &DiskRef| r.name == name && Some(r) != now;
+        self.queue.retain(|j| !gone(&j.disk));
+        if let Some(a) = self.active.as_ref().filter(|a| gone(&a.disk)) {
+            if a.releasing.load(Ordering::SeqCst) {
+                // Our own unmount/eject at the end of the scan.
+                self.released.insert(a.disk.clone());
+            } else if !a.control.is_cancelled() {
+                a.control.cancel();
+                self.log(Level::Warn, format!("/dev/{} was removed during the scan; it will resume next time.", a.disk));
+            }
+        }
+        let detached: Vec<DiskRef> = self.handled.iter().filter(|r| gone(r)).cloned().collect();
+        self.handled.retain(|r| !gone(r));
+        for disk in detached {
+            let expected = self.released.remove(&disk);
+            let _ = self.ev.send(Event::Detached { disk, expected });
+        }
+        self.released.retain(|r| !gone(r));
+    }
+
+    /// Is this attachment still connected?
+    fn attached(disk: &DiskRef) -> bool {
+        di_platform::resolve_whole(&disk.name).is_ok_and(|now| now == *disk)
+    }
+
+    fn busy(&self, disk: &DiskRef) -> bool {
+        self.active.as_ref().is_some_and(|a| a.disk == *disk) || self.queue.iter().any(|j| j.disk == *disk)
+    }
+
     fn on_command(&mut self, cmd: Command) {
+        let gone_msg = |disk: &DiskRef| {
+            format!("/dev/{disk} is not the disk you chose any more (it was disconnected); nothing done.")
+        };
         match cmd {
             Command::Scan { disk, identity, label } => {
-                let busy = self.active.as_ref().is_some_and(|a| a.disk == disk) || self.queue.iter().any(|j| j.disk == disk);
-                if busy {
+                if self.busy(&disk) {
                     self.log(Level::Info, format!("/dev/{disk} is already being scanned or queued."));
+                } else if !Self::attached(&disk) {
+                    self.log(Level::Warn, gone_msg(&disk));
                 } else {
                     self.handled.insert(disk.clone());
                     self.queue.push_back(Job { disk, identity, label, verify: false, rescan_after_secs: 0 });
                 }
             }
             Command::Verify(disk) => {
-                let busy = self.active.as_ref().is_some_and(|a| a.disk == disk) || self.queue.iter().any(|j| j.disk == disk);
-                if busy {
+                if self.busy(&disk) {
                     self.log(Level::Info, format!("/dev/{disk} is already being scanned or queued."));
+                } else if !Self::attached(&disk) {
+                    self.log(Level::Warn, gone_msg(&disk));
                 } else {
                     self.handled.insert(disk.clone());
                     self.log(Level::Info, format!("Verifying likely duplicates on /dev/{disk} (full hashes)."));
@@ -346,9 +377,9 @@ impl State {
         }
     }
 
-    fn release(&mut self, disk: &str, eject: bool) {
-        let result = di_platform::probe(disk).and_then(|p| {
-            self.released.insert(p.id.clone());
+    fn release(&mut self, disk: &DiskRef, eject: bool) {
+        let result = di_platform::probe_ref(disk).and_then(|p| {
+            self.released.insert(disk.clone());
             di_platform::unmount_drive(&p, false)?;
             if eject {
                 di_platform::eject(&p)?;
@@ -368,24 +399,23 @@ impl State {
     fn settle(&mut self) {
         let ready: Vec<String> =
             self.pending.iter().filter(|(_, t)| t.elapsed() >= SETTLE).map(|(d, _)| d.clone()).collect();
-        for d in ready {
-            self.pending.remove(&d);
+        for name in ready {
+            self.pending.remove(&name);
             if self.shutting_down {
                 continue;
             }
-            let Ok(id) = di_platform::resolve_whole(&d) else { continue };
-            let busy = self.handled.contains(&id)
-                || self.queue.iter().any(|j| j.disk == id)
-                || self.active.as_ref().is_some_and(|a| a.disk == id);
-            if busy {
+            let Ok(disk) = di_platform::resolve_whole(&name) else { continue };
+            // Another disk at this name: the one we knew there was disconnected.
+            self.forget_gone(&disk.name, Some(&disk));
+            if self.handled.contains(&disk) || self.busy(&disk) {
                 continue;
             }
-            self.handled.insert(id.clone());
-            let Ok(probe) = di_platform::probe(&id) else { continue };
+            let Ok(probe) = di_platform::probe_ref(&disk) else { continue };
+            self.handled.insert(disk.clone());
             let (drive_id, label, outcome) = self.decide(&probe);
             if outcome == Outcome::Queued {
                 self.queue.push_back(Job {
-                    disk: id.clone(),
+                    disk: disk.clone(),
                     identity: IdentityChoice::Auto,
                     label: None,
                     verify: false,
@@ -395,7 +425,7 @@ impl State {
             if matches!(outcome, Outcome::Ignored(_)) && !probe.is_external() {
                 continue; // internal disks: not worth an event
             }
-            let _ = self.ev.send(Event::Attached { disk: id, probe: Box::new(probe), drive_id, label, outcome });
+            let _ = self.ev.send(Event::Attached { disk, probe: Box::new(probe), drive_id, label, outcome });
         }
     }
 
@@ -466,7 +496,8 @@ impl State {
         *self.job.lock().unwrap() = None;
         let result = match a.handle.join() {
             Ok(Ok(report)) => {
-                if report.unmounted {
+                // Unless its removal was already seen (and reported as expected).
+                if report.unmounted && self.handled.contains(&a.disk) {
                     self.released.insert(a.disk.clone());
                 }
                 if let Ok(cat) = Catalog::open(&self.opts.catalog_path) {
@@ -490,7 +521,7 @@ impl State {
         let control = Arc::new(Control::default());
         let req = DeviceScanRequest {
             catalog_path: self.opts.catalog_path.clone(),
-            dev: job.disk.clone(),
+            target: DiskTarget::Attached(job.disk.clone()),
             label: job.label,
             walk: self.opts.walk.clone(),
             resume: ResumeMode::Auto,

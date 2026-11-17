@@ -12,7 +12,7 @@ use plist::{Dictionary, Value};
 
 use crate::util::run;
 use crate::{
-    Bus, CMD_TIMEOUT, DeviceEvent, DriveProbe, IdentitySource, Medium, PartitionProbe, UsbInfo, VolumeProbe,
+    Bus, CMD_TIMEOUT, DeviceEvent, DiskRef, DriveProbe, IdentitySource, Medium, PartitionProbe, UsbInfo, VolumeProbe,
 };
 
 // -------------------------------------------------------------------------------------
@@ -194,10 +194,19 @@ fn non_fs_partition(content: &str) -> bool {
     )
 }
 
-pub fn resolve_whole(dev: &str) -> Result<String> {
+pub fn resolve_whole(dev: &str) -> Result<DiskRef> {
     let dev = strip_dev(dev);
     let list = diskutil_plist(&["list", "-plist"])?.into_dictionary().context("diskutil list")?;
-    Topology::from_list(&list).physical(&dev).with_context(|| format!("no such disk {dev}"))
+    let whole = Topology::from_list(&list).physical(&dev).with_context(|| format!("no such disk {dev}"))?;
+    let seq = media_entry_id(&ioreg_path("IOMedia", &whole).with_context(|| format!("no IOMedia for {whole}"))?);
+    Ok(DiskRef { name: whole, seq })
+}
+
+/// IORegistry entry id of the IOMedia at the end of an `ioreg_path`: unique for the
+/// lifetime of the boot, so a disk attached later under the same BSD name has another.
+/// See Note [Disks are not their names] in di-platform.
+fn media_entry_id(path: &[Dictionary]) -> Option<u64> {
+    path.last().and_then(|media| u(media, "IORegistryEntryID"))
 }
 
 pub fn probe(dev: &str) -> Result<DriveProbe> {
@@ -337,7 +346,7 @@ pub fn probe(dev: &str) -> Result<DriveProbe> {
     });
 
     Ok(DriveProbe {
-        id: whole.clone(),
+        disk: DiskRef { name: whole.clone(), seq: ioreg.media_id },
         dev_path: format!("/dev/{whole}"),
         vendor: s(&chars, "Vendor Name"),
         model,
@@ -431,12 +440,21 @@ struct IoregInfo {
     protocol: Option<Dictionary>,
     usb: Option<UsbInfo>,
     usb_raw: serde_json::Value,
+    /// IORegistry entry id of the whole disk's IOMedia (`media_entry_id`).
+    media_id: Option<u64>,
 }
 
 impl IoregInfo {
     fn for_disk(bsd: &str) -> IoregInfo {
-        let mut out = IoregInfo { characteristics: None, protocol: None, usb: None, usb_raw: serde_json::Value::Null };
+        let mut out = IoregInfo {
+            characteristics: None,
+            protocol: None,
+            usb: None,
+            usb_raw: serde_json::Value::Null,
+            media_id: None,
+        };
         if let Some(path) = ioreg_path("IOBlockStorageDevice", bsd) {
+            out.media_id = media_entry_id(&path);
             for node in path.iter().rev() {
                 if out.characteristics.is_none() {
                     out.characteristics = node.get("Device Characteristics").and_then(Value::as_dictionary).cloned();
@@ -538,17 +556,19 @@ pub fn mount_ro(vol: &VolumeProbe) -> Result<PathBuf> {
 
 pub fn unmount_drive(drive: &DriveProbe, force: bool) -> Result<()> {
     // Unmounting the physical disk also unmounts APFS volumes of containers on it.
+    let name = &drive.disk.name;
     let mut args = vec!["unmountDisk"];
     if force {
         args.push("force");
     }
-    args.push(&drive.id);
-    run("/usr/sbin/diskutil", &args, CMD_TIMEOUT).with_context(|| format!("unmounting {}", drive.id))?;
+    args.push(name);
+    run("/usr/sbin/diskutil", &args, CMD_TIMEOUT).with_context(|| format!("unmounting {name}"))?;
     Ok(())
 }
 
 pub fn eject(drive: &DriveProbe) -> Result<()> {
-    run("/usr/sbin/diskutil", &["eject", &drive.id], CMD_TIMEOUT).with_context(|| format!("ejecting {}", drive.id))?;
+    let name = &drive.disk.name;
+    run("/usr/sbin/diskutil", &["eject", name], CMD_TIMEOUT).with_context(|| format!("ejecting {name}"))?;
     Ok(())
 }
 

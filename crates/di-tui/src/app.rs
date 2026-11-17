@@ -14,7 +14,7 @@ use di_core::query::QueryError;
 use di_core::search::{Hit, SortKey, Summary};
 use di_core::views::{self, BrowseEntry, BrowseSort, DirInfo, DriveDetail, FileDetail, FsChoice};
 use di_doctor::Report;
-use di_platform::DriveProbe;
+use di_platform::{DiskRef, DriveProbe};
 use di_scan::controller::{Command, Controller, Event, Level, Outcome, Question};
 use di_scan::device::{IdentityChoice, report_lines, unscannable_summary};
 
@@ -81,7 +81,7 @@ pub enum ConnStatus {
 pub struct DriveRow {
     pub drive_id: Option<i64>,
     /// Connected disk (`disk4`, `sdb`).
-    pub disk: Option<String>,
+    pub disk: Option<DiskRef>,
     pub label: String,
     pub capacity: u64,
     pub last_seen_at: Option<i64>,
@@ -93,8 +93,8 @@ pub enum Modal {
     Help,
     Label { drive_id: i64, input: LineEdit },
     Notes { drive_id: i64, input: LineEdit },
-    NewDrive { disk: String, desc: String, input: LineEdit },
-    Ambiguous { disk: String, desc: String, candidates: Vec<(i64, String)>, sel: usize },
+    NewDrive { disk: DiskRef, desc: String, input: LineEdit },
+    Ambiguous { disk: DiskRef, desc: String, candidates: Vec<(i64, String)>, sel: usize },
     ConfirmQuit,
     File(Box<FileDetail>),
     /// The search filter reference; `sel` indexes `di_core::filters::FILTERS`.
@@ -200,7 +200,7 @@ pub struct App {
 
     pub drives: Vec<DriveRow>,
     pub catalog_drives: Vec<DriveSummary>,
-    pub connected: BTreeMap<String, Connected>,
+    pub connected: BTreeMap<DiskRef, Connected>,
     pub drive_sel: usize,
     pub detail: Option<DriveDetail>,
     pub job_lines: VecDeque<String>,
@@ -452,6 +452,13 @@ impl App {
                 if !expected {
                     self.push_log(Level::Info, format!("/dev/{disk} disconnected."));
                 }
+                // A question about this disk has no answer any more.
+                if let Some(Modal::NewDrive { disk: asked, .. } | Modal::Ambiguous { disk: asked, .. }) = &self.modal
+                    && *asked == disk
+                {
+                    self.modal = None;
+                    self.toast(format!("/dev/{disk} was disconnected before you answered."));
+                }
                 self.connected.remove(&disk);
             }
             Event::JobStarted { disk } => {
@@ -533,7 +540,7 @@ impl App {
         }
         rows.sort_by_key(|r| (r.disk.is_none(), r.drive_id.unwrap_or(0)));
         self.drives = rows;
-        // Keep the selection on the same drive.
+        // Keep the selection on the same drive (a new one: the same attachment).
         if let Some((id, disk)) = selected {
             if let Some(i) = self.drives.iter().position(|r| (r.drive_id.is_some() && r.drive_id == id) || (id.is_none() && r.disk == disk)) {
                 self.drive_sel = i;

@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use di_core::Catalog;
 use di_core::drives::{DriveMatch, DriveRecord, FsRecord, PartitionRecord};
 use di_model::smart::{SmartReport, SmartUnavailable};
-use di_platform::{DriveProbe, Medium, VolumeProbe, identity};
+use di_platform::{DiskRef, DriveProbe, Medium, VolumeProbe, identity};
 use di_walk::{Control, Progress, WalkConfig, host};
 
 use crate::content::{ContentOutcome, DriveTrouble};
@@ -83,10 +83,21 @@ pub enum IdentityChoice {
     SameAs(i64),
 }
 
+/// Which disk a device scan is for.
+#[derive(Debug, Clone)]
+pub enum DiskTarget {
+    /// Whichever disk has this name now, or holds this partition (the command line:
+    /// `scan /dev/sdb1`).
+    Name(String),
+    /// This attachment only, refused if it is gone. See Note [Disks are not their names]
+    /// in di-platform.
+    Attached(DiskRef),
+}
+
 #[derive(Debug, Clone)]
 pub struct DeviceScanRequest {
     pub catalog_path: PathBuf,
-    pub dev: String,
+    pub target: DiskTarget,
     pub label: Option<String>,
     pub walk: WalkConfig,
     pub resume: ResumeMode,
@@ -326,7 +337,10 @@ pub fn scan_device(
     phase: &PhaseCell,
     on_step: &mut dyn FnMut(Step),
 ) -> Result<DeviceReport> {
-    let probe = di_platform::probe(&req.dev)?;
+    let probe = match &req.target {
+        DiskTarget::Name(dev) => di_platform::probe(dev)?,
+        DiskTarget::Attached(disk) => di_platform::probe_ref(disk)?,
+    };
     if probe.system_disk {
         bail!("{} holds the running system; refusing to touch it", probe.dev_path);
     }
@@ -394,7 +408,7 @@ pub fn scan_device(
                 }
             }
             on_step(Step::Mounting(vol));
-            let mp = match di_platform::mount_ro(vol) {
+            let mp = match di_platform::mount_ro(&probe, vol) {
                 Ok(mp) => mp,
                 Err(e) => break 'outcome VolumeOutcome::Failed(format!("{e:#}")),
             };

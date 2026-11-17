@@ -21,7 +21,7 @@ use catalog_cmd::SessionGuard;
 use di_core::Catalog;
 use di_core::search::{SearchError, SearchRequest, SortKey, search, summarize};
 use di_scan::controller::{ControllerOptions, NewDrivePolicy, Policy};
-use di_scan::device::{DeviceScanRequest, IdentityChoice};
+use di_scan::device::{DeviceScanRequest, DiskTarget, IdentityChoice};
 use di_tui::TuiOptions;
 use di_scan::{ResumeMode, ScanRequest};
 use di_walk::{Control, Progress, WalkConfig};
@@ -372,7 +372,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 };
                 let req = DeviceScanRequest {
                     catalog_path: db,
-                    dev: target,
+                    target: DiskTarget::Name(target),
                     label,
                     walk,
                     resume,

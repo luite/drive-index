@@ -25,7 +25,8 @@ Runs on macOS and Linux. Written in Rust.
   drives get a label prompt. `drive-index watch` does the same without a UI.
 - **Never mixes up drives.** A drive whose capacity, model or serial differs from a known
   drive's is never taken for it, even when both sat in the same USB dock or got the same
-  device name (`/dev/sda`, `disk4`).
+  device name (`/dev/sda`, `disk4`). Answers and commands apply to the disk they were given
+  for; if that disk was unplugged and another took its name, they are refused.
 - **Read-only, always.** Filesystems are mounted read-only (on Linux, also without journal
   replay), and nothing is ever written to a scanned drive. Drives already mounted read-write
   by the system are scanned as they are.
@@ -228,6 +229,12 @@ The device tests attach and eject a real disk image, so they are opt-in (macOS):
 ```sh
 hdiutil create -size 64m -fs ExFAT -volname DI_TEST /tmp/di-test.dmg
 DI_TEST_IMAGE=/tmp/di-test.dmg cargo test -p di-tui --test controller_flow -- --ignored --nocapture
+```
+
+On Linux, loop devices attached through udisks2 (needs `sfdisk` and `udisksctl`):
+
+```sh
+cargo test -p di-platform --test linux_loop -- --ignored --nocapture
 ```
 
 The workspace has these crates:

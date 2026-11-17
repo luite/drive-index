@@ -11,7 +11,7 @@ use zbus::blocking::fdo::ObjectManagerProxy;
 use zbus::zvariant::{OwnedValue, Value};
 
 use crate::{
-    AuthAnswer, Bus, DeviceEvent, DriveProbe, IdentitySource, Medium, PartitionProbe, UsbInfo, VolumeProbe,
+    AuthAnswer, Bus, DeviceEvent, DiskRef, DriveProbe, IdentitySource, Medium, PartitionProbe, UsbInfo, VolumeProbe,
 };
 
 const DEST: &str = "org.freedesktop.UDisks2";
@@ -203,6 +203,16 @@ fn sysfs_block(name: &str) -> PathBuf {
     PathBuf::from("/sys/class/block").join(name)
 }
 
+/// The kernel's attachment number of a whole disk (5.15 and later). See Note [Disks are
+/// not their names] in di-platform.
+fn diskseq(name: &str) -> Option<u64> {
+    read_trim(sysfs_block(name).join("diskseq")).and_then(|s| s.parse().ok())
+}
+
+fn disk_ref(name: &str) -> DiskRef {
+    DiskRef { name: name.to_string(), seq: diskseq(name) }
+}
+
 // Note [Rotational or not]
 // ~~~~~~~~~~~~~~~~~~~~~~~~
 // udisks' RotationRate comes from the drive's ATA IDENTIFY data (via udev), when that
@@ -376,12 +386,13 @@ pub fn list_drives() -> Result<Vec<String>> {
     Ok(names)
 }
 
-pub fn resolve_whole(dev: &str) -> Result<String> {
+pub fn resolve_whole(dev: &str) -> Result<DiskRef> {
     let conn = connect()?;
     let o = Objects::load(&conn)?;
     let name = dev.trim_start_matches("/dev/");
     let block = o.block_by_name(name).with_context(|| format!("no such block device {name}"))?;
-    o.dev_name(&o.whole_of(&block)).context("whole disk has no device name")
+    let whole = o.dev_name(&o.whole_of(&block)).context("whole disk has no device name")?;
+    Ok(disk_ref(&whole))
 }
 
 pub fn probe(dev: &str) -> Result<DriveProbe> {
@@ -527,7 +538,7 @@ pub fn probe(dev: &str) -> Result<DriveProbe> {
     });
 
     Ok(DriveProbe {
-        id: whole_name.clone(),
+        disk: disk_ref(&whole_name),
         dev_path: format!("/dev/{whole_name}"),
         vendor: o.str(d, DRIVE, "Vendor").or_else(|| udev.get("ID_VENDOR").cloned()),
         model: o.str(d, DRIVE, "Model").or_else(|| udev.get("ID_MODEL").cloned()),
@@ -565,9 +576,12 @@ fn no_interaction() -> HashMap<&'static str, Value<'static>> {
 }
 
 /// The kernel removes a disk's sysfs entry when it goes away. A detached loop device
-/// keeps its entry (and /dev node) but has size 0.
+/// keeps its entry (and /dev node) but has size 0. Another disk under the same name has
+/// another `diskseq`.
 pub fn is_present(drive: &DriveProbe) -> bool {
-    read_trim(sysfs_block(&drive.id).join("size")).and_then(|s| s.parse::<u64>().ok()).is_some_and(|n| n > 0)
+    let name = &drive.disk.name;
+    diskseq(name) == drive.disk.seq
+        && read_trim(sysfs_block(name).join("size")).and_then(|s| s.parse::<u64>().ok()).is_some_and(|n| n > 0)
 }
 
 pub fn mount_ro(vol: &VolumeProbe) -> Result<PathBuf> {
@@ -607,7 +621,8 @@ pub fn mount_ro(vol: &VolumeProbe) -> Result<PathBuf> {
 pub fn unmount_drive(drive: &DriveProbe, force: bool) -> Result<()> {
     let conn = connect()?;
     let o = Objects::load(&conn)?;
-    let whole = o.block_by_name(&drive.id).with_context(|| format!("no such block device {}", drive.id))?;
+    let name = &drive.disk.name;
+    let whole = o.block_by_name(name).with_context(|| format!("no such block device {name}"))?;
     for b in o.blocks().filter(|b| o.whole_of(b) == whole) {
         if !o.bytes_list(b, FILESYSTEM, "MountPoints").is_empty() {
             let mut args = no_interaction();
@@ -622,7 +637,8 @@ pub fn unmount_drive(drive: &DriveProbe, force: bool) -> Result<()> {
 pub fn eject(drive: &DriveProbe) -> Result<()> {
     let conn = connect()?;
     let o = Objects::load(&conn)?;
-    let whole = o.block_by_name(&drive.id).with_context(|| format!("no such block device {}", drive.id))?;
+    let name = &drive.disk.name;
+    let whole = o.block_by_name(name).with_context(|| format!("no such block device {name}"))?;
     if o.has(&whole, LOOP) {
         call(&conn, &whole, LOOP, "Delete", no_interaction()).context("detaching loop device")?;
         return Ok(());

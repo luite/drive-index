@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use anyhow::{Context, bail};
 use serde::Serialize;
 
 pub mod identity;
@@ -128,6 +129,40 @@ impl VolumeProbe {
     }
 }
 
+// Note [Disks are not their names]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Device names are reused. Unplug the disk at /dev/sda, plug in another, and the new
+// one is /dev/sda too (macOS: disk4). So anything that refers to a disk across time (a
+// question to the user, a queued scan, an eject command) holds a `DiskRef`: the name
+// plus the attachment number the kernel gives that disk while it is connected and never
+// gives to another (Linux: `diskseq`, from 5.15; macOS: the IORegistry entry id of the
+// disk's IOMedia). The functions here that act on a disk (`mount_ro`, `unmount_drive`,
+// `eject`, `probe_ref`) refuse a reference whose disk is gone, so a decision made about
+// one disk is never carried out on the next disk that gets its name.
+//
+// Device events (`DeviceEvent`) carry plain names: they only say that something changed
+// at a name, and the receiver finds out which attachment is there now.
+//
+// Which catalog drive a disk is follows from its identifiers and disk facts, never from
+// its name (Note [Disk facts] in di-model:identity).
+
+/// One attachment of a whole disk. See Note [Disks are not their names].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct DiskRef {
+    /// `sdb` (Linux), `disk7` (macOS).
+    pub name: String,
+    /// The attachment number; None where the platform has none (Linux before 5.15),
+    /// and then references are only as good as names.
+    pub seq: Option<u64>,
+}
+
+/// Displays as the name, for messages like `/dev/{disk}`.
+impl std::fmt::Display for DiskRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
 /// Who reported a drive's vendor, model, serial and WWN. Only what the disk reports
 /// itself identifies the disk. See Note [Disk facts] in di-model:identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -143,8 +178,8 @@ pub enum IdentitySource {
 /// Everything known about one whole drive.
 #[derive(Debug, Clone, Serialize)]
 pub struct DriveProbe {
-    /// Platform id of the whole disk: `disk7` (macOS), `sdb` (Linux).
-    pub id: String,
+    /// This attachment of the whole disk (`disk7` on macOS, `sdb` on Linux).
+    pub disk: DiskRef,
     pub dev_path: String,
     pub vendor: Option<String>,
     pub model: Option<String>,
@@ -181,29 +216,51 @@ impl DriveProbe {
     }
 }
 
+/// Something changed at a whole-disk name. See Note [Disks are not their names].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceEvent {
-    /// A whole disk appeared (also emitted for every disk present at startup).
+    /// A disk appeared at this name (also emitted for every disk present at startup).
     Appeared(String),
+    /// The disk at this name, or part of it, went away.
     Disappeared(String),
 }
 
-/// Whole-disk ids of all drives the platform knows about.
+/// Whole-disk names of all drives the platform knows about.
 pub fn list_drives() -> anyhow::Result<Vec<String>> {
     sys::list_drives()
 }
 
-/// Cheaply map any disk/partition/volume identifier to its physical whole disk id.
-pub fn resolve_whole(dev: &str) -> anyhow::Result<String> {
+/// Map any disk/partition/volume identifier to the attachment of its physical whole
+/// disk. Cheaper than a probe.
+pub fn resolve_whole(dev: &str) -> anyhow::Result<DiskRef> {
     sys::resolve_whole(dev)
 }
 
 /// Describe one whole disk (accepts `disk7`, `/dev/disk7`, `sdb`, `/dev/sdb`, or any
-/// partition/volume of it).
+/// partition/volume of it), whichever disk that is now.
 pub fn probe(dev: &str) -> anyhow::Result<DriveProbe> {
     let mut p = sys::probe(dev)?;
     mark_efi(&mut p);
     Ok(p)
+}
+
+/// Describe one attachment of a disk; refused if it is gone, even if another disk now
+/// has its name. See Note [Disks are not their names].
+pub fn probe_ref(disk: &DiskRef) -> anyhow::Result<DriveProbe> {
+    let p = probe(&disk.name)?;
+    if p.disk != *disk {
+        bail!("{} was disconnected; /dev/{} is now a different disk", disk.name, disk.name);
+    }
+    Ok(p)
+}
+
+/// Fail unless `disk` is still attached. See Note [Disks are not their names].
+fn ensure_attached(disk: &DiskRef) -> anyhow::Result<()> {
+    let now = sys::resolve_whole(&disk.name).with_context(|| format!("{} was disconnected", disk.name))?;
+    if now != *disk {
+        bail!("{} was disconnected; /dev/{} is now a different disk, which is left alone", disk.name, disk.name);
+    }
+    Ok(())
 }
 
 /// EFI system partitions hold boot files, not user data, and the empty ones Disk
@@ -231,19 +288,22 @@ pub fn is_present(drive: &DriveProbe) -> bool {
     sys::is_present(drive)
 }
 
-/// Mount a volume read-only (and hidden from Finder on macOS). Returns the mount point.
-/// If it is already mounted, returns the existing mount point unchanged.
-pub fn mount_ro(vol: &VolumeProbe) -> anyhow::Result<PathBuf> {
+/// Mount a volume of `drive` read-only (and hidden from Finder on macOS). Returns the
+/// mount point. If it is already mounted, returns the existing mount point unchanged.
+pub fn mount_ro(drive: &DriveProbe, vol: &VolumeProbe) -> anyhow::Result<PathBuf> {
+    ensure_attached(&drive.disk)?;
     sys::mount_ro(vol)
 }
 
 /// Unmount every volume of a drive.
 pub fn unmount_drive(drive: &DriveProbe, force: bool) -> anyhow::Result<()> {
+    ensure_attached(&drive.disk)?;
     sys::unmount_drive(drive, force)
 }
 
 /// Eject / power off a drive (all its volumes must be unmounted).
 pub fn eject(drive: &DriveProbe) -> anyhow::Result<()> {
+    ensure_attached(&drive.disk)?;
     sys::eject(drive)
 }
 
